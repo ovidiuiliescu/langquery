@@ -1,0 +1,16 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <PackAsTool>true</PackAsTool>
+    <ToolCommandName>langquery</ToolCommandName>
+    <PackageId>LangQuery.Cli.Tool</PackageId>
+    <Description>LangQuery command-line tool</Description>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="..\LangQuery.Core\LangQuery.Core.csproj" />
+    <ProjectReference Include="..\LangQuery.Query\LangQuery.Query.csproj" />
+    <ProjectReference Include="..\LangQuery.Roslyn\LangQuery.Roslyn.csproj" />
+    <ProjectReference Include="..\LangQuery.Storage.Sqlite\LangQuery.Storage.Sqlite.csproj" />
+  </ItemGroup>
+</Project>
