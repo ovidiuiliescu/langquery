@@ -32,7 +32,7 @@ public sealed class LangQueryServiceTests
         var extractor = new FakeExtractor();
         var storage = new FakeStorageEngine
         {
-            SchemaToReturn = new SchemaDescription(5, [new SchemaEntity("v1_files", "view", "", [])])
+            SchemaToReturn = new SchemaDescription(6, [new SchemaEntity("v1_files", "view", "", [])])
         };
 
         var service = new LangQueryService(extractor, storage);
@@ -42,7 +42,7 @@ public sealed class LangQueryServiceTests
         Assert.Equal(2, storage.CallLog.Count);
         Assert.Equal("InitializeReadOnly", storage.CallLog[0]);
         Assert.Equal("DescribeSchema", storage.CallLog[1]);
-        Assert.Equal(5, result.SchemaVersion);
+        Assert.Equal(6, result.SchemaVersion);
     }
 
     [Fact]
@@ -673,10 +673,10 @@ public sealed class LangQueryServiceTests
                 "csharp",
                 [new TypeFact(typeKey, "Type", "Class", "Public", "", "Fake.Type", 1, 1)],
                 Array.Empty<TypeInheritanceFact>(),
-                [new MethodFact(methodKey, "Run", "void", "", 0, "Public", "", "Method", null, typeKey, 1, 1, 1, 1)],
-                [new LineFact(1, content, methodKey, 0, 1)],
+                [new MethodFact(methodKey, "Run", "void", "", "Public", "", "Method", null, typeKey, 1, 1, 1, 1)],
+                [new LineFact(1, content, methodKey, 0)],
                 [new VariableFact(variableKey, methodKey, "local", "Local", "int", 1)],
-                [new LineVariableFact(1, methodKey, "local", variableKey)],
+                [new LineVariableFact(1, variableKey)],
                 Array.Empty<InvocationFact>(),
                 [new SymbolReferenceFact(1, methodKey, "local", "Variable", null, "Int32")]);
         }
@@ -690,7 +690,7 @@ public sealed class LangQueryServiceTests
 
         public QueryResult QueryResultToReturn { get; init; } = new QueryResult([], [], false, TimeSpan.Zero);
 
-        public SchemaDescription SchemaToReturn { get; init; } = new SchemaDescription(5, []);
+        public SchemaDescription SchemaToReturn { get; init; } = new SchemaDescription(6, []);
 
         public IReadOnlyList<FileFacts> LastPersistFacts { get; private set; } = [];
 

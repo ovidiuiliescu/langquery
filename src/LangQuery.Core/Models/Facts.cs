@@ -35,7 +35,6 @@ public sealed record MethodFact(
     string Name,
     string ReturnType,
     string Parameters,
-    int ParameterCount,
     string AccessModifier,
     string Modifiers,
     string ImplementationKind,
@@ -50,8 +49,7 @@ public sealed record LineFact(
     int LineNumber,
     string Text,
     string? MethodKey,
-    int BlockDepthInMethod,
-    int VariableCount);
+    int BlockDepthInMethod);
 
 public sealed record VariableFact(
     string VariableKey,
@@ -63,9 +61,7 @@ public sealed record VariableFact(
 
 public sealed record LineVariableFact(
     int LineNumber,
-    string MethodKey,
-    string VariableName,
-    string? VariableKey);
+    string VariableKey);
 
 public sealed record InvocationFact(
     string MethodKey,

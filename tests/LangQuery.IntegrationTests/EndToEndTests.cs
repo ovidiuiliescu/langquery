@@ -33,7 +33,7 @@ public sealed class EndToEndTests
             Assert.True(methodCount >= 12);
 
             var schema = await service.GetSchemaAsync(new SchemaOptions(databasePath), CancellationToken.None);
-            Assert.Equal(5, schema.SchemaVersion);
+            Assert.Equal(6, schema.SchemaVersion);
             Assert.Contains(schema.Entities, entity => entity.Name == "v1_methods" && entity.Kind == "view");
             Assert.Contains(schema.Entities, entity => entity.Name == "v1_type_inheritances" && entity.Kind == "view");
         }
@@ -123,7 +123,7 @@ public sealed class EndToEndTests
                     l.line_number,
                     l.text,
                     t.full_name AS class_name,
-                    COUNT(DISTINCT lv.variable_name) AS variable_usage_count,
+                    COUNT(DISTINCT v.name) AS variable_usage_count,
                     SUM(
                         CASE
                             WHEN v.name LIKE 'sumOf%'
@@ -140,7 +140,7 @@ public sealed class EndToEndTests
                 JOIN v1_variables v ON v.variable_id = lv.variable_id
                 WHERE ti.base_type_name IN ('ComputationBase', 'RevenueCalculator')
                 GROUP BY l.line_id, l.file_path, l.line_number, l.text, t.full_name
-                HAVING COUNT(DISTINCT lv.variable_name) >= 3
+                HAVING COUNT(DISTINCT v.name) >= 3
                     AND SUM(
                         CASE
                             WHEN v.name LIKE 'sumOf%'
@@ -266,7 +266,7 @@ public sealed class EndToEndTests
                 SELECT
                     l.file_path,
                     l.line_number,
-                    lv.variable_name,
+                    v.name AS variable_name,
                     v.type_name AS variable_type,
                     t.name AS class_name
                 FROM v1_line_variables lv
@@ -275,7 +275,7 @@ public sealed class EndToEndTests
                 JOIN v1_methods m ON m.method_id = l.method_id
                 JOIN v1_types t ON t.type_id = m.type_id
                 JOIN v1_type_inheritances ti ON ti.type_id = t.type_id
-                WHERE lv.variable_name LIKE 'sumOf%'
+                WHERE v.name LIKE 'sumOf%'
                     AND LOWER(COALESCE(v.type_name, '')) IN ('int', 'int32', 'system.int32')
                     AND ti.base_type_name IN ('ComputationBase', 'RevenueCalculator')
                 ORDER BY l.file_path, l.line_number;
@@ -321,7 +321,7 @@ public sealed class EndToEndTests
                 && Equals(row["access_modifier"], "Public")
                 && Convert.ToString(row["modifiers"], CultureInfo.InvariantCulture)?.Contains("Abstract", StringComparison.Ordinal) == true);
 
-            const string methodSql = "SELECT name, modifiers, implementation_kind, access_modifier, parameter_count, parameters FROM v1_methods WHERE name = 'CalculateQuarterRevenue';";
+            const string methodSql = "SELECT m.name, m.modifiers, m.implementation_kind, m.access_modifier, (SELECT COUNT(*) FROM v1_variables v WHERE v.method_id = m.method_id AND v.kind = 'Parameter') AS parameter_count, m.parameters FROM v1_methods m WHERE m.name = 'CalculateQuarterRevenue';";
             var methodResult = await service.QueryAsync(new QueryOptions(databasePath, methodSql, MaxRows: 10), CancellationToken.None);
 
             Assert.Contains(methodResult.Rows, row =>

@@ -22,7 +22,7 @@ public sealed class SqliteStorageEngineTests
             var schemaVersion = await storage.GetSchemaVersionAsync(databasePath, CancellationToken.None);
             var schema = await storage.DescribeSchemaAsync(databasePath, CancellationToken.None);
 
-            Assert.Equal(5, schemaVersion);
+            Assert.Equal(6, schemaVersion);
             Assert.Contains(schema.Entities, entity => entity.Name == "meta_schema_version" && entity.Kind == "table");
             Assert.Contains(schema.Entities, entity => entity.Name == "v1_files" && entity.Kind == "view");
             Assert.Contains(schema.Entities, entity => entity.Name == "v1_methods" && entity.Kind == "view");
@@ -36,7 +36,6 @@ public sealed class SqliteStorageEngineTests
             Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "access_modifier", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "modifiers", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "parameters", StringComparison.OrdinalIgnoreCase));
-            Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "parameter_count", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "implementation_kind", StringComparison.OrdinalIgnoreCase));
             Assert.Contains(methodsView.Columns, column => string.Equals(column.Name, "parent_method_key", StringComparison.OrdinalIgnoreCase));
 
@@ -575,7 +574,7 @@ public sealed class SqliteStorageEngineTests
 
             Assert.Single(query.Rows);
             Assert.Equal("owner", Convert.ToString(query.Rows[0]["key"], CultureInfo.InvariantCulture));
-            Assert.Equal(5, schema.SchemaVersion);
+            Assert.Equal(6, schema.SchemaVersion);
         }
         finally
         {
@@ -744,7 +743,7 @@ public sealed class SqliteStorageEngineTests
     }
 
     [Fact]
-    public async Task InitializeAsync_WhenMigrationFails_RollsBackPartialSchemaChanges()
+    public async Task InitializeAsync_RebuildsLegacySchemaToCurrentVersion()
     {
         var databasePath = CreateTempDatabasePath();
 
@@ -767,14 +766,10 @@ public sealed class SqliteStorageEngineTests
             }
 
             var storage = CreateStorage();
-            await Assert.ThrowsAnyAsync<SqliteException>(() => storage.InitializeAsync(databasePath, CancellationToken.None));
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
 
             await using var verifyConnection = new SqliteConnection($"Data Source={databasePath}");
             await verifyConnection.OpenAsync(CancellationToken.None);
-
-            await using var metaScanStateCommand = verifyConnection.CreateCommand();
-            metaScanStateCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta_scan_state';";
-            var metaScanStateCount = Convert.ToInt32(await metaScanStateCommand.ExecuteScalarAsync(CancellationToken.None), CultureInfo.InvariantCulture);
 
             await using var methodsCommand = verifyConnection.CreateCommand();
             methodsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'methods';";
@@ -784,9 +779,8 @@ public sealed class SqliteStorageEngineTests
             schemaVersionCommand.CommandText = "SELECT version FROM meta_schema_version ORDER BY version DESC LIMIT 1;";
             var schemaVersion = Convert.ToInt32(await schemaVersionCommand.ExecuteScalarAsync(CancellationToken.None), CultureInfo.InvariantCulture);
 
-            Assert.Equal(0, metaScanStateCount);
-            Assert.Equal(0, methodsCount);
-            Assert.Equal(0, schemaVersion);
+            Assert.Equal(1, methodsCount);
+            Assert.Equal(6, schemaVersion);
         }
         finally
         {
@@ -817,12 +811,12 @@ public sealed class SqliteStorageEngineTests
 
         var methods = new[]
         {
-            new MethodFact(methodKey, "Run", "int", "int value", 1, "Public", "", "Method", null, typeKey, 3, 6, 5, 9)
+            new MethodFact(methodKey, "Run", "int", "int value", "Public", "", "Method", null, typeKey, 3, 6, 5, 9)
         };
 
         var lines = new[]
         {
-            new LineFact(4, "return value;", methodKey, 0, 1)
+            new LineFact(4, "return value;", methodKey, 0)
         };
 
         var variables = new[]
@@ -832,7 +826,7 @@ public sealed class SqliteStorageEngineTests
 
         var lineVariables = new[]
         {
-            new LineVariableFact(4, methodKey, "value", variableKey)
+            new LineVariableFact(4, variableKey)
         };
 
         var invocations = new[]
@@ -879,15 +873,15 @@ public sealed class SqliteStorageEngineTests
             [new TypeFact(typeKey, "NestedWidget", "Class", "Public", "", "Sample.NestedWidget", 1, 1)],
             Array.Empty<TypeInheritanceFact>(),
             [
-                new MethodFact(rootMethod, "Run", "int", "", 0, "Public", "", "Method", null, typeKey, 3, 9, 5, 9),
-                new MethodFact(nestedMethod, "LocalAdjust", "int", "int value", 1, "Local", "", "LocalFunction", rootMethod, typeKey, 4, 7, 9, 9)
+                new MethodFact(rootMethod, "Run", "int", "", "Public", "", "Method", null, typeKey, 3, 9, 5, 9),
+                new MethodFact(nestedMethod, "LocalAdjust", "int", "int value", "Local", "", "LocalFunction", rootMethod, typeKey, 4, 7, 9, 9)
             ],
             [
-                new LineFact(4, "int LocalAdjust(int value)", rootMethod, 0, 0),
-                new LineFact(6, "return value;", nestedMethod, 1, 1)
+                new LineFact(4, "int LocalAdjust(int value)", rootMethod, 0),
+                new LineFact(6, "return value;", nestedMethod, 1)
             ],
             [new VariableFact("nested-value", nestedMethod, "value", "Parameter", "int", 4)],
-            [new LineVariableFact(6, nestedMethod, "value", "nested-value")],
+            [new LineVariableFact(6, "nested-value")],
             Array.Empty<InvocationFact>(),
             [new SymbolReferenceFact(6, nestedMethod, "value", "Variable", null, "Int32")]);
     }

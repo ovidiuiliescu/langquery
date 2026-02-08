@@ -38,7 +38,6 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         var lineVariables = new List<LineVariableFact>();
         var invocations = new List<InvocationFact>();
         var symbolRefs = new List<SymbolReferenceFact>();
-        var variableCountByMethodAndLine = new Dictionary<(string MethodKey, int LineNumber), HashSet<string>>();
         var blockDepthByMethodAndLine = new Dictionary<(string MethodKey, int LineNumber), int>();
 
         foreach (var context in methods)
@@ -71,8 +70,7 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
                 var resolvedVariable = ResolveVariableBySymbol(symbol, variablesByDeclarationSpan);
                 if (resolvedVariable is not null)
                 {
-                    AddLineVariableUsage(variableCountByMethodAndLine, context.Fact.MethodKey, lineNumber, symbolName);
-                    lineVariables.Add(new LineVariableFact(lineNumber, context.Fact.MethodKey, symbolName, resolvedVariable.VariableKey));
+                    lineVariables.Add(new LineVariableFact(lineNumber, resolvedVariable.VariableKey));
                     symbolRefs.Add(new SymbolReferenceFact(
                         lineNumber,
                         context.Fact.MethodKey,
@@ -84,9 +82,8 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
                 else if ((symbol is ILocalSymbol || symbol is IParameterSymbol)
                     && variablesByName.TryGetValue(symbolName, out var candidates))
                 {
-                    AddLineVariableUsage(variableCountByMethodAndLine, context.Fact.MethodKey, lineNumber, symbolName);
                     var selected = SelectBestVariable(candidates, lineNumber);
-                    lineVariables.Add(new LineVariableFact(lineNumber, context.Fact.MethodKey, symbolName, selected.VariableKey));
+                    lineVariables.Add(new LineVariableFact(lineNumber, selected.VariableKey));
                     symbolRefs.Add(new SymbolReferenceFact(
                         lineNumber,
                         context.Fact.MethodKey,
@@ -156,23 +153,17 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         {
             var lineNumber = line.LineNumber + 1;
             var methodKey = ResolveMethodForLine(methodRanges, lineNumber);
-            var variableCount = 0;
             var depth = 0;
 
             if (methodKey is not null)
             {
-                if (variableCountByMethodAndLine.TryGetValue((methodKey, lineNumber), out var variableNames))
-                {
-                    variableCount = variableNames.Count;
-                }
-
                 if (blockDepthByMethodAndLine.TryGetValue((methodKey, lineNumber), out var mappedDepth))
                 {
                     depth = mappedDepth;
                 }
             }
 
-            lineFacts.Add(new LineFact(lineNumber, line.ToString(), methodKey, depth, variableCount));
+            lineFacts.Add(new LineFact(lineNumber, line.ToString(), methodKey, depth));
         }
 
         return new FileFacts(
@@ -324,7 +315,6 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             name,
             returnType,
             parameterSignature,
-            parameters.Count,
             accessModifier,
             modifierSet,
             implementationKind,
@@ -751,21 +741,6 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             AnonymousMethodExpressionSyntax anonymousMethod => anonymousMethod.Block,
             _ => null
         };
-    }
-
-    private static void AddLineVariableUsage(
-        IDictionary<(string MethodKey, int LineNumber), HashSet<string>> lookup,
-        string methodKey,
-        int lineNumber,
-        string variableName)
-    {
-        if (!lookup.TryGetValue((methodKey, lineNumber), out var values))
-        {
-            values = new HashSet<string>(StringComparer.Ordinal);
-            lookup[(methodKey, lineNumber)] = values;
-        }
-
-        values.Add(variableName);
     }
 
     private static void UpdateDepth(

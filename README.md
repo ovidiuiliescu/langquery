@@ -2,42 +2,39 @@
 
 LangQuery turns a C# solution into a local SQLite knowledge base that you query with SQL.
 
-It is useful for both humans and coding agents, especially when you want repeatable, data-backed answers about a codebase instead of ad-hoc grep scripts.
+## Who it is for
+
+- Humans: ask ad-hoc architecture and code-intelligence questions with concrete SQL evidence.
+- Coding agents (recommended): get faster, more deterministic answers than grep-heavy exploration.
+- Automation/scripts: reuse proven SQL queries in shell scripts, CI checks, or other utilities.
 
 ## What it is (and why agent workflows love it)
 
-- LangQuery scans C# code and stores code facts in SQLite.
-- You query stable public views (`v1_*`) plus metadata entities (`meta_*`).
+- LangQuery scans C# code and stores code facts in SQLite (e.g. what variables are declared where, what types they have, where each method is used, etc)
+- This allows you to query your codebase with literal SQL queries.
+- It allows agents to quickly answer REALLY complicated questions about your codebase (see [Advanced coding-agent example (constraint-heavy)](#advanced-coding-agent-example-constraint-heavy)).
 - Queries are read-only (`SELECT`, `WITH`, `EXPLAIN`), so exploration is safe by default.
 - Agents can use the same command surface repeatedly, which makes answers more consistent and auditable.
 - Saves on tokens, and (past the initial scan) is much faster than grep and regular code exploration.
 
-## Agent-first usage
-
-LangQuery is especially strong when paired with coding agents.
-
-### Generate agent skill files
+## Getting started for AI agents (quick)
 
 ```bash
-langquery installskill codex
+git clone <this-repo-url>
+cd langquery
+pwsh ./InstallAsTool.ps1
 ```
 
-Other targets: `claude`, `opencode`, `all`.
+Then in the project you want to analyze:
 
-Sample output (trimmed):
-
-```json
-{
-  "command": "installskill",
-  "success": true,
-  "data": {
-    "target": "codex",
-    "files": [".../.codex/skills/langquery/SKILL.md"]
-  }
-}
+```bash
+cd /path/to/your/project
+langquery installskill codex # you can replace "codex" with "claude", "opencode" or "all"
 ```
 
-Sample screenshots:
+Then .. just enjoy!
+
+Sample screenshots (taken from OpenCode):
 
 ![Agent using LangQuery after installskill](docs/images/agent-tool-install-sample.png)
 
@@ -127,11 +124,6 @@ LEFT JOIN v1_lines l
 ORDER BY p.file_path, p.line_number;
 ```
 
-Sample findings (2 usages found):
-
-- `src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs:324` in `InsertMethodsAsync` (`command.Parameters` + `typeIds : IReadOnlyDictionary<string, long>`)
-- `src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs:379` in `InsertLinesAsync` (`command.Parameters` + `methodIds : IReadOnlyDictionary<string, long>`)
-
 Why this is a strong agent example:
 
 - It translates fuzzy natural-language constraints into explicit SQL predicates.
@@ -154,38 +146,57 @@ SELECT
   COUNT(*) AS line_count,
   SUM(variable_count) AS total_variable_mentions,
   ROUND(AVG(CAST(variable_count AS REAL)), 4) AS avg_variable_density
-FROM v1_lines
+FROM (
+  SELECT
+    l.line_id,
+    l.file_path,
+    COUNT(DISTINCT lv.variable_id) AS variable_count
+  FROM v1_lines l
+  LEFT JOIN v1_line_variables lv ON lv.line_id = l.line_id
+  GROUP BY l.line_id, l.file_path
+) line_density
 GROUP BY file_path
 ORDER BY avg_variable_density DESC, line_count DESC, file_path;
 ```
-
-Sample results (sorted by average variable density per line):
-
-| file | lines | total vars | avg density |
-|---|---:|---:|---:|
-| src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs | 822 | 596 | 0.7251 |
-| src/LangQuery.Core/Services/LangQueryService.cs | 518 | 255 | 0.4923 |
-| src/LangQuery.Query/Validation/ReadOnlySqlSafetyValidator.cs | 237 | 116 | 0.4895 |
-| src/LangQuery.Roslyn/Extraction/CSharpCodeFactsExtractor.cs | 1089 | 474 | 0.4353 |
-| tests/LangQuery.IntegrationTests/CliUsabilityTests.cs | 1228 | 526 | 0.4283 |
-| tests/LangQuery.IntegrationTests/EndToEndTests.cs | 700 | 267 | 0.3814 |
-| tests/LangQuery.UnitTests/UnitTest1.cs | 931 | 340 | 0.3652 |
-| tests/LangQuery.UnitTests/LangQueryServiceTests.cs | 747 | 258 | 0.3454 |
-| tests/LangQuery.UnitTests/CSharpCodeFactsExtractorTests.cs | 611 | 152 | 0.2488 |
-| tests/LangQuery.UnitTests/ReadOnlySqlSafetyValidatorTests.cs | 169 | 31 | 0.1834 |
-| src/LangQuery.Core/Models/Results.cs | 40 | 1 | 0.0250 |
-| src/LangQuery.Cli/Program.cs | 1397 | 0 | 0.0000 |
-| src/LangQuery.Core/Models/Facts.cs | 83 | 0 | 0.0000 |
-| src/LangQuery.Core/Abstractions/IStorageEngine.cs | 26 | 0 | 0.0000 |
-| src/LangQuery.Core/Abstractions/ICodeFactsExtractor.cs | 11 | 0 | 0.0000 |
-| src/LangQuery.Core/Abstractions/ISqlSafetyValidator.cs | 9 | 0 | 0.0000 |
-| src/LangQuery.Core/Models/Options.cs | 8 | 0 | 0.0000 |
 
 Why this is useful:
 
 - It gives a fast, project-wide complexity signal for prioritizing review/refactoring.
 - It combines raw size (`line_count`) with density (`avg_variable_density`) for better triage.
 - It is deterministic and easy to rerun after a scan to track complexity drift over time.
+
+### Advanced coding-agent example (top 5 densest files + methodology)
+
+Prompt:
+
+```text
+What are the top 5 most densest files (in terms of variable) in the codebase? Tell me how you got the answer.
+```
+
+Core SQL logic used:
+
+```sql
+WITH file_vars AS (
+  SELECT file_id, file_path, COUNT(*) AS variable_count
+  FROM v1_variables
+  GROUP BY file_id, file_path
+),
+file_lines AS (
+  SELECT file_id, file_path, COUNT(DISTINCT line_number) AS line_count
+  FROM v1_lines
+  GROUP BY file_id, file_path
+)
+SELECT
+  l.file_path,
+  COALESCE(v.variable_count, 0) AS variable_count,
+  l.line_count,
+  1.0 * COALESCE(v.variable_count, 0) / NULLIF(l.line_count, 0) AS variables_per_line
+FROM file_lines l
+LEFT JOIN file_vars v ON v.file_id = l.file_id
+WHERE l.line_count > 0
+ORDER BY variables_per_line DESC, variable_count DESC
+LIMIT 5;
+```
 
 ## Quick useful commands (first)
 
@@ -195,20 +206,6 @@ These assume that `langquery` is already installed (steps to install are describ
 
 ```bash
 langquery scan --pretty
-```
-
-Sample output (trimmed):
-
-```json
-{
-  "command": "scan",
-  "success": true,
-  "data": {
-    "FilesDiscovered": 16,
-    "FilesScanned": 16,
-    "DatabasePath": ".../.langquery.MySolution.db.sqlite"
-  }
-}
 ```
 
 ### 2) Find high-risk large methods quickly
@@ -247,13 +244,15 @@ This is a fast way to find high-traffic calls and likely coupling hotspots.
 ```bash
 langquery "
 SELECT
-  file_path,
-  line_number,
-  variable_count,
-  text
-FROM v1_lines
-WHERE variable_count >= 3
-ORDER BY variable_count DESC, file_path, line_number
+  l.file_path,
+  l.line_number,
+  COUNT(DISTINCT lv.variable_id) AS variable_count,
+  l.text
+FROM v1_lines l
+JOIN v1_line_variables lv ON lv.line_id = l.line_id
+GROUP BY l.line_id, l.file_path, l.line_number, l.text
+HAVING COUNT(DISTINCT lv.variable_id) >= 3
+ORDER BY variable_count DESC, l.file_path, l.line_number
 LIMIT 25
 "
 ```
@@ -281,20 +280,6 @@ Useful when you need to understand nested behavior boundaries.
 
 ```bash
 langquery info --pretty
-```
-
-Sample output (trimmed):
-
-```json
-{
-  "command": "info",
-  "success": true,
-  "data": {
-    "tool": "LangQuery.Cli",
-    "version": "1.0.0+...",
-    "framework": ".NET 8.0.22"
-  }
-}
 ```
 
 ### BONUS: Get schema constants for better queries
@@ -344,14 +329,14 @@ LIMIT 10
 "
 ```
 
-### `sumOf*` integer references by line
+### References by line, filtered by reference partial name and type
 
 ```bash
 langquery "
 SELECT
   l.file_path,
   l.line_number,
-  lv.variable_name,
+  v.name AS variable_name,
   v.type_name AS variable_type,
   t.name AS class_name
 FROM v1_line_variables lv
@@ -360,7 +345,7 @@ JOIN v1_lines l ON l.line_id = lv.line_id
 JOIN v1_methods m ON m.method_id = l.method_id
 JOIN v1_types t ON t.type_id = m.type_id
 JOIN v1_type_inheritances ti ON ti.type_id = t.type_id
-WHERE lv.variable_name LIKE 'sumOf%'
+WHERE v.name LIKE 'sumOf%'
   AND LOWER(COALESCE(v.type_name, '')) IN ('int', 'int32', 'system.int32')
   AND ti.base_type_name IN ('ComputationBase', 'RevenueCalculator')
 ORDER BY l.file_path, l.line_number
@@ -388,13 +373,17 @@ ORDER BY file_path, implementation_kind, name
 ```bash
 langquery "
 SELECT
-  file_path,
-  name,
-  parameter_count,
-  parameters
-FROM v1_methods
-WHERE implementation_kind IN ('Method', 'Constructor', 'LocalFunction')
-ORDER BY parameter_count DESC, file_path, name
+  m.file_path,
+  m.name,
+  COUNT(v.variable_id) AS parameter_count,
+  m.parameters
+FROM v1_methods m
+LEFT JOIN v1_variables v
+  ON v.method_id = m.method_id
+ AND v.kind = 'Parameter'
+WHERE m.implementation_kind IN ('Method', 'Constructor', 'LocalFunction')
+GROUP BY m.method_id, m.file_path, m.name, m.parameters
+ORDER BY parameter_count DESC, m.file_path, m.name
 LIMIT 25
 "
 ```
@@ -473,301 +462,22 @@ dotnet run --project src/LangQuery.Cli -- <command>
 
 `--changed-only` is experimental; a full `langquery scan` is safer and preferred.
 
-## Arguments and flags reference (each one explained)
-
-### `<sql>` (short query positional argument)
-
-What it is:
-
-- A positional SQL string when you run `langquery "SELECT ..."` without specifying `sql`.
-
-What it does:
-
-- Runs your SQL against the LangQuery DB.
-- If the DB does not exist yet, LangQuery scans first.
-- Pretty JSON is enabled by default in this short form.
-
-How it looks:
-
-```bash
-langquery "
-SELECT COUNT(*) AS method_count
-FROM v1_methods
-"
-```
-
-Small sample output:
-
-```json
-{
-  "command": "sql",
-  "success": true,
-  "data": { "Columns": ["method_count"], "Rows": [{ "method_count": 259 }] }
-}
-```
-
-### `--solution <folder-or-.sln>`
-
-What it is:
-
-- Path to either a solution folder or a specific `.sln` file.
-
-What it does:
-
-- Tells LangQuery exactly which solution to scan/query.
-- If omitted, current directory is used and must contain exactly one `.sln`.
-
-How it looks:
-
-```bash
-langquery scan --solution tests/sample_solution --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "scan",
-  "success": true,
-  "data": { "DatabasePath": ".../.langquery.SampleSolution.db.sqlite" }
-}
-```
-
-### `--db <path>`
-
-What it is:
-
-- Custom SQLite DB path.
-
-What it does:
-
-- Lets you control where the LangQuery database is written/read.
-- If omitted, default is `<solution-folder>/.langquery.<solution-name>.db.sqlite`.
-
-How it looks:
-
-```bash
-langquery scan --solution tests/sample_solution --db .tmp/readme-sample.db --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "scan",
-  "success": true,
-  "data": { "DatabasePath": ".tmp/readme-sample.db" }
-}
-```
-
-### `--query <sql>`
-
-What it is:
-
-- Explicit SQL argument for the `sql` command.
-
-What it does:
-
-- Runs the provided SQL (read-only validator enforced).
-
-How it looks:
-
-```bash
-langquery sql --query "
-SELECT file_path
-FROM v1_files
-LIMIT 5
-" --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "sql",
-  "success": true,
-  "data": { "Columns": ["file_path"], "Rows": [{ "file_path": ".../Program.cs" }] }
-}
-```
-
-### `--max-rows <n>`
-
-What it is:
-
-- Row limit guard for SQL results.
-
-What it does:
-
-- Caps returned row count to keep outputs bounded.
-- Sets `Truncated: true` when more rows exist.
-
-How it looks:
-
-```bash
-langquery sql --query "
-SELECT file_path
-FROM v1_files
-ORDER BY file_path
-" --max-rows 1 --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "sql",
-  "success": true,
-  "data": { "Rows": [{ "file_path": ".../Program.cs" }], "Truncated": true }
-}
-```
-
-### `--timeout-ms <n>`
-
-What it is:
-
-- Query timeout in milliseconds.
-
-What it does:
-
-- Limits SQL execution time for predictability.
-
-How it looks:
-
-```bash
-langquery sql --query "
-SELECT COUNT(*) AS method_count
-FROM v1_methods
-" --timeout-ms 15000 --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "sql",
-  "success": true,
-  "data": { "Rows": [{ "method_count": 259 }], "Duration": "00:00:00.0018462" }
-}
-```
-
-### `--changed-only`
-
-What it is:
-
-- Experimental incremental scan flag for `scan`.
-
-What it does:
-
-- Re-indexes only changed files (and tracks unchanged/removed counts).
-- Can leave stale metadata in unchanged dependents; run a full `langquery scan` when you need maximum correctness.
-
-How it looks:
-
-```bash
-langquery scan --changed-only --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "scan",
-  "success": true,
-  "data": { "FilesScanned": 0, "FilesUnchanged": 16, "FilesRemoved": 0 }
-}
-```
-
-### `--pretty`
-
-What it is:
-
-- Global formatting flag.
-
-What it does:
-
-- Pretty-prints JSON output for readability.
-
-How it looks:
-
-```bash
-langquery help --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "help",
-  "success": true,
-  "data": {
-    "description": "LangQuery CLI"
-  }
-}
-```
-
-### `[file-name]` (positional argument for `exportjson`)
-
-What it is:
-
-- Optional export path for the JSON dump.
-
-What it does:
-
-- Writes full DB export to that file.
-- If omitted, output path defaults to DB name with `.json` extension.
-
-How it looks:
-
-```bash
-langquery exportjson .tmp/readme-export.json --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "exportjson",
-  "success": true,
-  "data": {
-    "database_path": ".../.langquery.LangQuery.db.sqlite",
-    "export_path": ".../.tmp/readme-export.json",
-    "entities": 21
-  }
-}
-```
-
-### `<claude|codex|opencode|all>` (positional target for `installskill`)
-
-What it is:
-
-- Agent target selector for skill generation.
-
-What it does:
-
-- Generates `SKILL.md` files in the target agent folder(s): `.claude`, `.codex`, `.opencode`.
-
-How it looks:
-
-```bash
-langquery installskill all --pretty
-```
-
-Small sample output:
-
-```json
-{
-  "command": "installskill",
-  "success": true,
-  "data": {
-    "target": "all",
-    "files": [
-      ".../.claude/skills/langquery/SKILL.md",
-      ".../.codex/skills/langquery/SKILL.md",
-      ".../.opencode/skills/langquery/SKILL.md"
-    ]
-  }
-}
-```
+## Arguments and flags reference
+
+Use this table as a quick lookup for the most important inputs.
+
+| Argument / flag | Used with | What it does | Default / notes | Example |
+|---|---|---|---|---|
+| `<sql>` (positional) | short form: `langquery "..."` | Runs a read-only SQL query directly (without `sql --query`). | If DB is missing, LangQuery scans first. Pretty JSON is enabled in this short form. | `langquery "SELECT COUNT(*) FROM v1_methods"` |
+| `--query <sql>` | `sql` | Runs the provided read-only SQL query. | Equivalent in purpose to positional `<sql>`, but explicit. | `langquery sql --query "SELECT file_path FROM v1_files LIMIT 5"` |
+| `--solution <folder-or-.sln>` | `scan`, `sql`, `schema`, `simpleschema`, `exportjson` | Selects the solution folder or `.sln` to use. | If omitted, current directory must resolve to exactly one `.sln`. | `langquery scan --solution tests/sample_solution --pretty` |
+| `--db <path>` | `scan`, `sql`, `schema`, `simpleschema`, `exportjson` | Uses a specific SQLite DB path. | Default: `<solution-folder>/.langquery.<solution-name>.db.sqlite`. | `langquery scan --solution tests/sample_solution --db .tmp/readme.db --pretty` |
+| `--max-rows <n>` | `sql` | Limits returned rows. | Sets `Truncated: true` when more rows exist. | `langquery sql --query "SELECT file_path FROM v1_files" --max-rows 10 --pretty` |
+| `--timeout-ms <n>` | `sql` | Sets SQL execution timeout in milliseconds. | Helps keep queries predictable in automation/agents. | `langquery sql --query "SELECT COUNT(*) FROM v1_methods" --timeout-ms 15000 --pretty` |
+| `--changed-only` | `scan` | Performs incremental scan of changed files only. | Experimental; prefer full `langquery scan` for maximum correctness. | `langquery scan --changed-only --pretty` |
+| `--pretty` | most commands | Pretty-prints JSON output. | Best for human readability and docs/examples. | `langquery help --pretty` |
+| `[file-name]` (positional) | `exportjson` | Output file path for exported JSON. | If omitted, uses DB name with `.json`. | `langquery exportjson .tmp/export.json --pretty` |
+| `target` (positional: `claude`, `codex`, `opencode`, or `all`) | `installskill` | Chooses which agent target(s) to generate `SKILL.md` for. | Writes into `.claude`, `.codex`, `.opencode` as applicable. | `langquery installskill all --pretty` |
 
 ## Safety model
 
@@ -779,9 +489,31 @@ LangQuery allows only read-oriented top-level SQL:
 
 Mutation and DDL statements are rejected.
 
-## Public schema
+## Database structure
 
-The public contract is the `v1_*` view set (plus metadata entities). For a full schema guide and additional SQL examples, see `docs/schema.md`.
+LangQuery stores internal data in private tables and exposes a stable public query surface through `v1_*` views.
+
+### Metadata tables
+
+| Table | Purpose |
+|---|---|
+| `meta_schema_version` | Current schema version and when it was applied. |
+| `meta_capabilities` | Runtime metadata (for example SQL mode and language support). |
+| `meta_scan_state` | Latest scan details (time, scanned files, removed files). |
+
+### Public query views (`v1_*`)
+
+| View | Purpose |
+|---|---|
+| `v1_files` | Indexed files and content hashes. |
+| `v1_types` | Type declarations (`kind`, `access_modifier`, `modifiers`). |
+| `v1_type_inheritances` | Inheritance and interface implementation edges. |
+| `v1_methods` | Implementations (`Method`, `Constructor`, `LocalFunction`, `Lambda`, `AnonymousMethod`) plus `parameters`. |
+| `v1_lines` | Per-line facts (method mapping and nesting depth). |
+| `v1_variables` | Variable declarations per method. |
+| `v1_line_variables` | Line-to-variable usage mappings. |
+| `v1_invocations` | Invocation expressions and targets. |
+| `v1_symbol_refs` | Symbol references (`Variable`, `Method`, `Property`, `Identifier`) plus optional semantic type/container fields. |
 
 ## Project layout
 

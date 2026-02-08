@@ -71,6 +71,8 @@ public sealed class CliUsabilityTests
             Assert.Contains("\"command\": \"help\"", skillContent, StringComparison.Ordinal);
             Assert.Contains("\"command\": \"examples\"", skillContent, StringComparison.Ordinal);
             Assert.Contains("\"command\": \"simpleschema\"", skillContent, StringComparison.Ordinal);
+            Assert.Contains("Simple schema legend", skillContent, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("text_fields", skillContent, StringComparison.OrdinalIgnoreCase);
             Assert.Contains("Re-scan after every code change", skillContent, StringComparison.Ordinal);
             Assert.Contains("--changed-only", skillContent, StringComparison.Ordinal);
             Assert.Contains("experimental", skillContent, StringComparison.OrdinalIgnoreCase);
@@ -590,32 +592,32 @@ public sealed class CliUsabilityTests
             Assert.Equal("simpleschema", payload.GetProperty("command").GetString());
 
             var data = GetPropertyIgnoreCase(payload, "data");
-            var entities = GetPropertyIgnoreCase(data, "entities").EnumerateArray().ToArray();
-            Assert.NotEmpty(entities);
+            var entities = GetPropertyIgnoreCase(data, "entities");
+            Assert.NotEmpty(entities.EnumerateObject());
 
-            var v1Types = entities.Single(entity => string.Equals(GetPropertyIgnoreCase(entity, "name").GetString(), "v1_types", StringComparison.OrdinalIgnoreCase));
-            var typeColumns = GetPropertyIgnoreCase(v1Types, "columns").EnumerateArray().ToArray();
-            Assert.Contains(typeColumns, column => string.Equals(GetPropertyIgnoreCase(column, "name").GetString(), "kind", StringComparison.OrdinalIgnoreCase));
-            Assert.All(typeColumns, column =>
-            {
-                Assert.True(HasPropertyIgnoreCase(column, "name"));
-                Assert.True(HasPropertyIgnoreCase(column, "type"));
-                Assert.False(HasPropertyIgnoreCase(column, "notnull"));
-                Assert.False(HasPropertyIgnoreCase(column, "primarykey"));
-            });
+            var v1Types = GetPropertyIgnoreCase(entities, "v1_types");
+            var typeColumns = v1Types.EnumerateObject()
+                .SelectMany(bucket => bucket.Value.EnumerateArray())
+                .Select(column => column.GetString())
+                .Where(column => !string.IsNullOrWhiteSpace(column))
+                .ToArray();
+            Assert.Contains(typeColumns, column => string.Equals(column, "kind", StringComparison.OrdinalIgnoreCase));
 
-            var v1Methods = entities.Single(entity => string.Equals(GetPropertyIgnoreCase(entity, "name").GetString(), "v1_methods", StringComparison.OrdinalIgnoreCase));
-            var methodColumns = GetPropertyIgnoreCase(v1Methods, "columns").EnumerateArray().ToArray();
-            Assert.Contains(methodColumns, column => string.Equals(GetPropertyIgnoreCase(column, "name").GetString(), "parameter_count", StringComparison.OrdinalIgnoreCase));
-            Assert.Contains(methodColumns, column => string.Equals(GetPropertyIgnoreCase(column, "name").GetString(), "parameters", StringComparison.OrdinalIgnoreCase));
+            var v1Methods = GetPropertyIgnoreCase(entities, "v1_methods");
+            var methodColumns = v1Methods.EnumerateObject()
+                .SelectMany(bucket => bucket.Value.EnumerateArray())
+                .Select(column => column.GetString())
+                .Where(column => !string.IsNullOrWhiteSpace(column))
+                .ToArray();
+            Assert.Contains(methodColumns, column => string.Equals(column, "parameters", StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(methodColumns, column => string.Equals(column, "parameter_count", StringComparison.OrdinalIgnoreCase));
 
-            var constants = GetPropertyIgnoreCase(data, "constants").EnumerateArray().ToArray();
-            Assert.True(constants.Length >= 7);
+            var constants = GetPropertyIgnoreCase(data, "constants");
+            Assert.True(constants.EnumerateObject().Count() >= 7);
 
-            var typeKindConstants = constants.Single(constant => string.Equals(GetPropertyIgnoreCase(constant, "location").GetString(), "v1_types.kind", StringComparison.OrdinalIgnoreCase));
-            var knownTypeKinds = GetPropertyIgnoreCase(typeKindConstants, "values")
+            var knownTypeKinds = GetPropertyIgnoreCase(constants, "v1_types.kind")
                 .EnumerateArray()
-                .Select(item => GetPropertyIgnoreCase(item, "value").GetString())
+                .Select(item => item.GetString())
                 .Where(item => !string.IsNullOrWhiteSpace(item))
                 .ToArray();
 
@@ -623,10 +625,9 @@ public sealed class CliUsabilityTests
             Assert.Contains("Record", knownTypeKinds);
             Assert.Contains("Enum", knownTypeKinds);
 
-            var implementationKindConstants = constants.Single(constant => string.Equals(GetPropertyIgnoreCase(constant, "location").GetString(), "v1_methods.implementation_kind", StringComparison.OrdinalIgnoreCase));
-            var knownImplementationKinds = GetPropertyIgnoreCase(implementationKindConstants, "values")
+            var knownImplementationKinds = GetPropertyIgnoreCase(constants, "v1_methods.implementation_kind")
                 .EnumerateArray()
-                .Select(item => GetPropertyIgnoreCase(item, "value").GetString())
+                .Select(item => item.GetString())
                 .Where(item => !string.IsNullOrWhiteSpace(item))
                 .ToArray();
 
@@ -635,10 +636,9 @@ public sealed class CliUsabilityTests
             Assert.Contains("Lambda", knownImplementationKinds);
             Assert.Contains("AnonymousMethod", knownImplementationKinds);
 
-            var symbolKindConstants = constants.Single(constant => string.Equals(GetPropertyIgnoreCase(constant, "location").GetString(), "v1_symbol_refs.symbol_kind", StringComparison.OrdinalIgnoreCase));
-            var knownSymbolKinds = GetPropertyIgnoreCase(symbolKindConstants, "values")
+            var knownSymbolKinds = GetPropertyIgnoreCase(constants, "v1_symbol_refs.symbol_kind")
                 .EnumerateArray()
-                .Select(item => GetPropertyIgnoreCase(item, "value").GetString())
+                .Select(item => item.GetString())
                 .Where(item => !string.IsNullOrWhiteSpace(item))
                 .ToArray();
 

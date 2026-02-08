@@ -9,7 +9,7 @@ namespace LangQuery.Storage.Sqlite.Storage;
 
 public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : IStorageEngine
 {
-    private const int CurrentSchemaVersion = 5;
+    private const int CurrentSchemaVersion = 6;
     private const int BusyTimeoutMs = 250;
     private const int MaxBusyRetries = 3;
     private const string OwnershipCapabilityKey = "owner";
@@ -34,7 +34,7 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
                 await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(token).ConfigureAwait(false);
                 try
                 {
-                    await ApplyMigrationsAsync(connection, tx, token).ConfigureAwait(false);
+                    await ApplyMigrationsAsync(connection, tx, version, token).ConfigureAwait(false);
                     await SetSchemaVersionAsync(connection, tx, CurrentSchemaVersion, token).ConfigureAwait(false);
                     await tx.CommitAsync(token).ConfigureAwait(false);
                 }
@@ -319,14 +319,13 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         {
             await using var command = connection.CreateCommand();
             command.Transaction = tx;
-            command.CommandText = "INSERT INTO methods(file_id, type_id, method_key, name, return_type, parameters, parameter_count, access_modifier, modifiers, implementation_kind, parent_method_key, line_start, line_end, column_start, column_end) VALUES ($fileId, $typeId, $methodKey, $name, $returnType, $parameters, $parameterCount, $accessModifier, $modifiers, $implementationKind, $parentMethodKey, $lineStart, $lineEnd, $columnStart, $columnEnd); SELECT last_insert_rowid();";
+            command.CommandText = "INSERT INTO methods(file_id, type_id, method_key, name, return_type, parameters, access_modifier, modifiers, implementation_kind, parent_method_key, line_start, line_end, column_start, column_end) VALUES ($fileId, $typeId, $methodKey, $name, $returnType, $parameters, $accessModifier, $modifiers, $implementationKind, $parentMethodKey, $lineStart, $lineEnd, $columnStart, $columnEnd); SELECT last_insert_rowid();";
             command.Parameters.AddWithValue("$fileId", fileId);
             command.Parameters.AddWithValue("$typeId", item.TypeKey is not null && typeIds.TryGetValue(item.TypeKey, out var typeId) ? typeId : DBNull.Value);
             command.Parameters.AddWithValue("$methodKey", item.MethodKey);
             command.Parameters.AddWithValue("$name", item.Name);
             command.Parameters.AddWithValue("$returnType", item.ReturnType);
             command.Parameters.AddWithValue("$parameters", item.Parameters);
-            command.Parameters.AddWithValue("$parameterCount", item.ParameterCount);
             command.Parameters.AddWithValue("$accessModifier", item.AccessModifier);
             command.Parameters.AddWithValue("$modifiers", item.Modifiers);
             command.Parameters.AddWithValue("$implementationKind", item.ImplementationKind);
@@ -374,13 +373,12 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         {
             await using var command = connection.CreateCommand();
             command.Transaction = tx;
-            command.CommandText = "INSERT INTO lines(file_id, method_id, line_number, text, block_depth_in_method, variable_count) VALUES ($fileId, $methodId, $lineNumber, $text, $depth, $variableCount); SELECT last_insert_rowid();";
+            command.CommandText = "INSERT INTO lines(file_id, method_id, line_number, text, block_depth_in_method) VALUES ($fileId, $methodId, $lineNumber, $text, $depth); SELECT last_insert_rowid();";
             command.Parameters.AddWithValue("$fileId", fileId);
             command.Parameters.AddWithValue("$methodId", item.MethodKey is not null && methodIds.TryGetValue(item.MethodKey, out var methodId) ? methodId : DBNull.Value);
             command.Parameters.AddWithValue("$lineNumber", item.LineNumber);
             command.Parameters.AddWithValue("$text", item.Text);
             command.Parameters.AddWithValue("$depth", item.BlockDepthInMethod);
-            command.Parameters.AddWithValue("$variableCount", item.VariableCount);
             var id = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
             ids[item.LineNumber] = Convert.ToInt64(id, CultureInfo.InvariantCulture);
         }
@@ -408,7 +406,6 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
             command.Parameters.AddWithValue("$declarationLine", item.DeclarationLine);
             var id = Convert.ToInt64(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
             ids[item.VariableKey] = id;
-            ids[$"{item.MethodKey}|{item.Name}"] = id;
         }
 
         return ids;
@@ -423,12 +420,12 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
                 continue;
             }
 
-            if (!TryResolveVariableId(item, variableIds, out var variableId))
+            if (!variableIds.TryGetValue(item.VariableKey, out var variableId))
             {
                 continue;
             }
 
-            await ExecuteAsync(connection, tx, "INSERT INTO line_variables(line_id, variable_id, variable_name) VALUES ($lineId, $variableId, $name);", cancellationToken, ("$lineId", lineId), ("$variableId", variableId), ("$name", item.VariableName)).ConfigureAwait(false);
+            await ExecuteAsync(connection, tx, "INSERT INTO line_variables(line_id, variable_id) VALUES ($lineId, $variableId);", cancellationToken, ("$lineId", lineId), ("$variableId", variableId)).ConfigureAwait(false);
         }
     }
 
@@ -464,16 +461,6 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         }
     }
 
-    private static bool TryResolveVariableId(LineVariableFact item, IReadOnlyDictionary<string, long> ids, out long value)
-    {
-        if (item.VariableKey is not null && ids.TryGetValue(item.VariableKey, out value))
-        {
-            return true;
-        }
-
-        return ids.TryGetValue($"{item.MethodKey}|{item.VariableName}", out value);
-    }
-
     private static async Task<IReadOnlyList<SchemaColumn>> DescribeColumnsAsync(SqliteConnection connection, string name, CancellationToken cancellationToken)
     {
         var columns = new List<SchemaColumn>();
@@ -501,8 +488,38 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task ApplyMigrationsAsync(SqliteConnection connection, SqliteTransaction tx, CancellationToken cancellationToken)
+    private static async Task ApplyMigrationsAsync(SqliteConnection connection, SqliteTransaction tx, int existingVersion, CancellationToken cancellationToken)
     {
+        if (existingVersion < CurrentSchemaVersion)
+        {
+            var resetStatements = new[]
+            {
+                "DROP VIEW IF EXISTS v1_files;",
+                "DROP VIEW IF EXISTS v1_types;",
+                "DROP VIEW IF EXISTS v1_methods;",
+                "DROP VIEW IF EXISTS v1_type_inheritances;",
+                "DROP VIEW IF EXISTS v1_lines;",
+                "DROP VIEW IF EXISTS v1_variables;",
+                "DROP VIEW IF EXISTS v1_line_variables;",
+                "DROP VIEW IF EXISTS v1_invocations;",
+                "DROP VIEW IF EXISTS v1_symbol_refs;",
+                "DROP TABLE IF EXISTS symbol_refs;",
+                "DROP TABLE IF EXISTS invocations;",
+                "DROP TABLE IF EXISTS line_variables;",
+                "DROP TABLE IF EXISTS variables;",
+                "DROP TABLE IF EXISTS lines;",
+                "DROP TABLE IF EXISTS type_inheritances;",
+                "DROP TABLE IF EXISTS methods;",
+                "DROP TABLE IF EXISTS types;",
+                "DROP TABLE IF EXISTS files;"
+            };
+
+            foreach (var sql in resetStatements)
+            {
+                await ExecuteAsync(connection, tx, sql, cancellationToken).ConfigureAwait(false);
+            }
+        }
+
         var setupStatements = new[]
         {
             "CREATE TABLE IF NOT EXISTS meta_schema_version(version INTEGER NOT NULL, applied_utc TEXT NOT NULL);",
@@ -510,16 +527,16 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
             "CREATE TABLE IF NOT EXISTS meta_scan_state(key TEXT PRIMARY KEY, value TEXT NOT NULL);",
             "CREATE TABLE IF NOT EXISTS files(id INTEGER PRIMARY KEY AUTOINCREMENT, path TEXT NOT NULL UNIQUE, hash TEXT NOT NULL, language TEXT NOT NULL, indexed_utc TEXT NOT NULL);",
             "CREATE TABLE IF NOT EXISTS types(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, type_key TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, access_modifier TEXT NOT NULL DEFAULT 'Internal', modifiers TEXT NOT NULL DEFAULT '', full_name TEXT NOT NULL, line INTEGER NOT NULL, column INTEGER NOT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE);",
-            "CREATE TABLE IF NOT EXISTS methods(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, type_id INTEGER NULL, method_key TEXT NOT NULL, name TEXT NOT NULL, return_type TEXT NOT NULL, parameters TEXT NOT NULL DEFAULT '', parameter_count INTEGER NOT NULL DEFAULT 0, access_modifier TEXT NOT NULL DEFAULT 'Private', modifiers TEXT NOT NULL DEFAULT '', implementation_kind TEXT NOT NULL DEFAULT 'Method', parent_method_key TEXT NULL, line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, column_start INTEGER NOT NULL, column_end INTEGER NOT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE, FOREIGN KEY(type_id) REFERENCES types(id) ON DELETE SET NULL);",
+            "CREATE TABLE IF NOT EXISTS methods(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, type_id INTEGER NULL, method_key TEXT NOT NULL, name TEXT NOT NULL, return_type TEXT NOT NULL, parameters TEXT NOT NULL DEFAULT '', access_modifier TEXT NOT NULL DEFAULT 'Private', modifiers TEXT NOT NULL DEFAULT '', implementation_kind TEXT NOT NULL DEFAULT 'Method', parent_method_key TEXT NULL, line_start INTEGER NOT NULL, line_end INTEGER NOT NULL, column_start INTEGER NOT NULL, column_end INTEGER NOT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE, FOREIGN KEY(type_id) REFERENCES types(id) ON DELETE SET NULL);",
             "CREATE TABLE IF NOT EXISTS type_inheritances(id INTEGER PRIMARY KEY AUTOINCREMENT, type_id INTEGER NOT NULL, base_type_name TEXT NOT NULL, relation_kind TEXT NOT NULL, FOREIGN KEY(type_id) REFERENCES types(id) ON DELETE CASCADE);",
-            "CREATE TABLE IF NOT EXISTS lines(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, method_id INTEGER NULL, line_number INTEGER NOT NULL, text TEXT NOT NULL, block_depth_in_method INTEGER NOT NULL, variable_count INTEGER NOT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE, FOREIGN KEY(method_id) REFERENCES methods(id) ON DELETE CASCADE, UNIQUE(file_id, line_number));",
+            "CREATE TABLE IF NOT EXISTS lines(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, method_id INTEGER NULL, line_number INTEGER NOT NULL, text TEXT NOT NULL, block_depth_in_method INTEGER NOT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE, FOREIGN KEY(method_id) REFERENCES methods(id) ON DELETE CASCADE, UNIQUE(file_id, line_number));",
             "CREATE TABLE IF NOT EXISTS variables(id INTEGER PRIMARY KEY AUTOINCREMENT, method_id INTEGER NOT NULL, variable_key TEXT NOT NULL, name TEXT NOT NULL, kind TEXT NOT NULL, type_name TEXT NULL, declaration_line INTEGER NOT NULL, FOREIGN KEY(method_id) REFERENCES methods(id) ON DELETE CASCADE);",
-            "CREATE TABLE IF NOT EXISTS line_variables(id INTEGER PRIMARY KEY AUTOINCREMENT, line_id INTEGER NOT NULL, variable_id INTEGER NOT NULL, variable_name TEXT NOT NULL, FOREIGN KEY(line_id) REFERENCES lines(id) ON DELETE CASCADE, FOREIGN KEY(variable_id) REFERENCES variables(id) ON DELETE CASCADE);",
+            "CREATE TABLE IF NOT EXISTS line_variables(id INTEGER PRIMARY KEY AUTOINCREMENT, line_id INTEGER NOT NULL, variable_id INTEGER NOT NULL, FOREIGN KEY(line_id) REFERENCES lines(id) ON DELETE CASCADE, FOREIGN KEY(variable_id) REFERENCES variables(id) ON DELETE CASCADE);",
             "CREATE TABLE IF NOT EXISTS invocations(id INTEGER PRIMARY KEY AUTOINCREMENT, method_id INTEGER NOT NULL, line_number INTEGER NOT NULL, expression TEXT NOT NULL, target_name TEXT NOT NULL, FOREIGN KEY(method_id) REFERENCES methods(id) ON DELETE CASCADE);",
             "CREATE TABLE IF NOT EXISTS symbol_refs(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, method_id INTEGER NULL, line_number INTEGER NOT NULL, symbol_name TEXT NOT NULL, symbol_kind TEXT NOT NULL, symbol_container_type_name TEXT NULL, symbol_type_name TEXT NULL, FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE, FOREIGN KEY(method_id) REFERENCES methods(id) ON DELETE CASCADE);",
-            "CREATE INDEX IF NOT EXISTS idx_lines_method_depth ON lines(method_id, block_depth_in_method, variable_count);",
+            "CREATE INDEX IF NOT EXISTS idx_lines_method_depth ON lines(method_id, block_depth_in_method);",
             "CREATE INDEX IF NOT EXISTS idx_type_inheritances_type ON type_inheritances(type_id, base_type_name, relation_kind);",
-            "CREATE INDEX IF NOT EXISTS idx_line_variables_line ON line_variables(line_id, variable_name);",
+            "CREATE INDEX IF NOT EXISTS idx_line_variables_line ON line_variables(line_id, variable_id);",
             "CREATE INDEX IF NOT EXISTS idx_variables_method_name ON variables(method_id, name);"
         };
 
@@ -533,7 +550,6 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         await EnsureColumnExistsAsync(connection, tx, "methods", "access_modifier", "TEXT NOT NULL DEFAULT 'Private'", cancellationToken).ConfigureAwait(false);
         await EnsureColumnExistsAsync(connection, tx, "methods", "modifiers", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
         await EnsureColumnExistsAsync(connection, tx, "methods", "parameters", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, tx, "methods", "parameter_count", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
         await EnsureColumnExistsAsync(connection, tx, "methods", "implementation_kind", "TEXT NOT NULL DEFAULT 'Method'", cancellationToken).ConfigureAwait(false);
         await EnsureColumnExistsAsync(connection, tx, "methods", "parent_method_key", "TEXT NULL", cancellationToken).ConfigureAwait(false);
         await EnsureColumnExistsAsync(connection, tx, "symbol_refs", "symbol_container_type_name", "TEXT NULL", cancellationToken).ConfigureAwait(false);
@@ -552,11 +568,11 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
             "DROP VIEW IF EXISTS v1_symbol_refs;",
             "CREATE VIEW v1_files AS SELECT id AS file_id, path AS file_path, hash, language, indexed_utc FROM files;",
             "CREATE VIEW v1_types AS SELECT t.id AS type_id, f.id AS file_id, f.path AS file_path, t.type_key, t.name, t.kind, t.access_modifier, t.modifiers, t.full_name, t.line, t.column FROM types t JOIN files f ON f.id=t.file_id;",
-            "CREATE VIEW v1_methods AS SELECT m.id AS method_id, f.id AS file_id, f.path AS file_path, m.type_id, m.method_key, m.name, m.return_type, m.parameters, m.parameter_count, m.access_modifier, m.modifiers, m.implementation_kind, m.parent_method_key, m.line_start, m.line_end, m.column_start, m.column_end FROM methods m JOIN files f ON f.id=m.file_id;",
+            "CREATE VIEW v1_methods AS SELECT m.id AS method_id, f.id AS file_id, f.path AS file_path, m.type_id, m.method_key, m.name, m.return_type, m.parameters, m.access_modifier, m.modifiers, m.implementation_kind, m.parent_method_key, m.line_start, m.line_end, m.column_start, m.column_end FROM methods m JOIN files f ON f.id=m.file_id;",
             "CREATE VIEW v1_type_inheritances AS SELECT ti.id AS type_inheritance_id, t.id AS type_id, f.id AS file_id, f.path AS file_path, t.type_key, t.name AS type_name, t.full_name AS type_full_name, ti.base_type_name, ti.relation_kind FROM type_inheritances ti JOIN types t ON t.id=ti.type_id JOIN files f ON f.id=t.file_id;",
-            "CREATE VIEW v1_lines AS SELECT l.id AS line_id, f.id AS file_id, f.path AS file_path, l.method_id, m.method_key, m.name AS method_name, l.line_number, l.text, l.block_depth_in_method, l.variable_count FROM lines l JOIN files f ON f.id=l.file_id LEFT JOIN methods m ON m.id=l.method_id;",
+            "CREATE VIEW v1_lines AS SELECT l.id AS line_id, f.id AS file_id, f.path AS file_path, l.method_id, m.method_key, m.name AS method_name, l.line_number, l.text, l.block_depth_in_method FROM lines l JOIN files f ON f.id=l.file_id LEFT JOIN methods m ON m.id=l.method_id;",
             "CREATE VIEW v1_variables AS SELECT v.id AS variable_id, m.id AS method_id, f.id AS file_id, f.path AS file_path, m.method_key, m.name AS method_name, v.variable_key, v.name, v.kind, v.type_name, v.declaration_line FROM variables v JOIN methods m ON m.id=v.method_id JOIN files f ON f.id=m.file_id;",
-            "CREATE VIEW v1_line_variables AS SELECT lv.id AS line_variable_id, l.id AS line_id, l.file_id, f.path AS file_path, l.method_id, m.method_key, l.line_number, lv.variable_name, lv.variable_id, v.variable_key FROM line_variables lv JOIN lines l ON l.id=lv.line_id JOIN files f ON f.id=l.file_id LEFT JOIN methods m ON m.id=l.method_id LEFT JOIN variables v ON v.id=lv.variable_id;",
+            "CREATE VIEW v1_line_variables AS SELECT lv.id AS line_variable_id, l.id AS line_id, l.file_id, f.path AS file_path, l.method_id, m.method_key, l.line_number, lv.variable_id, v.variable_key FROM line_variables lv JOIN lines l ON l.id=lv.line_id JOIN files f ON f.id=l.file_id LEFT JOIN methods m ON m.id=l.method_id LEFT JOIN variables v ON v.id=lv.variable_id;",
             "CREATE VIEW v1_invocations AS SELECT i.id AS invocation_id, m.id AS method_id, f.id AS file_id, f.path AS file_path, m.method_key, i.line_number, i.expression, i.target_name FROM invocations i JOIN methods m ON m.id=i.method_id JOIN files f ON f.id=m.file_id;",
             "CREATE VIEW v1_symbol_refs AS SELECT sr.id AS symbol_ref_id, sr.file_id, f.path AS file_path, sr.method_id, m.method_key, sr.line_number, sr.symbol_name, sr.symbol_kind, sr.symbol_container_type_name, sr.symbol_type_name FROM symbol_refs sr JOIN files f ON f.id=sr.file_id LEFT JOIN methods m ON m.id=sr.method_id;"
         };

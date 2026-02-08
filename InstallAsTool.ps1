@@ -14,8 +14,8 @@ if (-not (Test-Path $projectPath)) {
 }
 
 $now = Get-Date
-$secondInDay = [int][Math]::Floor($now.TimeOfDay.TotalSeconds)
-$version = "{0:yy}.{0:MM}.{0:dd}.{1}" -f $now, $secondInDay
+$minuteInDay = [int][Math]::Floor($now.TimeOfDay.TotalMinutes)
+$version = "{0:yy}.{0:MM}.{0:dd}.{1}" -f $now, $minuteInDay
 
 New-Item -ItemType Directory -Path $packageOutput -Force | Out-Null
 Get-ChildItem -Path $packageOutput -Filter "*.nupkg" -File -ErrorAction SilentlyContinue | Remove-Item -Force
@@ -31,6 +31,7 @@ $updateArgs = @(
     "tool", "update",
     "--global", $packageId,
     "--version", $version,
+    "--allow-downgrade",
     "--add-source", $packageOutput,
     "--ignore-failed-sources"
 )

@@ -45,26 +45,28 @@ public sealed class CSharpCodeFactsExtractorTests
 
         var method = Assert.Single(facts.Methods, method => method.Name == "Add");
         Assert.Equal("int", method.ReturnType);
-        Assert.Equal(2, method.ParameterCount);
         Assert.Equal("int left, int right", method.Parameters);
         Assert.Equal("Method", method.ImplementationKind);
         Assert.Equal("Public", method.AccessModifier);
+        Assert.Equal(2, facts.Variables.Count(variable => variable.MethodKey == method.MethodKey && variable.Kind == "Parameter"));
 
         Assert.Contains(facts.Variables, variable => variable.Name == "left" && variable.Kind == "Parameter");
         Assert.Contains(facts.Variables, variable => variable.Name == "right" && variable.Kind == "Parameter");
         Assert.Contains(facts.Variables, variable => variable.Name == "sum" && variable.Kind == "Local" && variable.TypeName == "var");
 
         Assert.Contains(facts.Invocations, invocation => invocation.LineNumber == 10 && invocation.TargetName == "WriteLine");
-        Assert.Contains(facts.LineVariables, usage => usage.LineNumber == 10 && usage.VariableName == "sum");
+        Assert.Contains(facts.LineVariables, usage =>
+            usage.LineNumber == 10
+            && facts.Variables.Any(variable => variable.VariableKey == usage.VariableKey && variable.Name == "sum"));
         Assert.Contains(facts.SymbolReferences, reference => reference.SymbolName == "WriteLine" && reference.SymbolKind == "Method");
 
         var invocationLine = Assert.Single(facts.Lines, line => line.LineNumber == 10);
         Assert.Equal(1, invocationLine.BlockDepthInMethod);
-        Assert.Equal(1, invocationLine.VariableCount);
+        Assert.Equal(1, facts.LineVariables.Count(item => item.LineNumber == 10));
 
         var returnLine = Assert.Single(facts.Lines, line => line.LineNumber == 13);
         Assert.Equal(0, returnLine.BlockDepthInMethod);
-        Assert.Equal(1, returnLine.VariableCount);
+        Assert.Equal(1, facts.LineVariables.Count(item => item.LineNumber == 13));
     }
 
     [Fact]
@@ -232,8 +234,8 @@ public sealed class CSharpCodeFactsExtractorTests
         Assert.Equal("Widget", constructor.Name);
         Assert.Equal("ctor", constructor.ReturnType);
         Assert.Equal("Public", constructor.AccessModifier);
-        Assert.Equal(1, constructor.ParameterCount);
         Assert.Equal("int capacity", constructor.Parameters);
+        Assert.Equal(1, facts.Variables.Count(variable => variable.MethodKey == constructor.MethodKey && variable.Kind == "Parameter"));
     }
 
     [Fact]
@@ -604,7 +606,8 @@ public sealed class CSharpCodeFactsExtractorTests
         var facts = extractor.Extract("ScopePlayground.cs", source, "HASH");
 
         Assert.Single(facts.Variables, variable => variable.Name == "scoped" && variable.Kind == "Local");
-        Assert.DoesNotContain(facts.LineVariables, usage => usage.VariableName == "scoped");
+        Assert.DoesNotContain(facts.LineVariables, usage =>
+            facts.Variables.Any(variable => variable.VariableKey == usage.VariableKey && variable.Name == "scoped"));
         Assert.Contains(facts.SymbolReferences, reference => reference.SymbolName == "scoped" && reference.SymbolKind == "Identifier");
     }
 }

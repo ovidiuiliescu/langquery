@@ -366,13 +366,6 @@ static async Task<int> HandleInstallSkillAsync(ParsedArgs parsed)
 
     try
     {
-        var helpOutput = SerializePayloadForSkill(new
-        {
-            command = "help",
-            success = true,
-            data = BuildHelpPayload()
-        });
-
         var examplesOutput = SerializePayloadForSkill(new
         {
             command = "examples",
@@ -407,7 +400,7 @@ static async Task<int> HandleInstallSkillAsync(ParsedArgs parsed)
             return 1;
         }
 
-        var skillContent = BuildInstallSkillContent(helpOutput, examplesOutput, simpleSchemaOutput, simpleSchemaSourceCommand);
+        var skillContent = BuildInstallSkillContent(examplesOutput, simpleSchemaOutput, simpleSchemaSourceCommand);
         var writtenFiles = new List<string>();
 
         foreach (var skillRoot in skillRoots)
@@ -508,23 +501,30 @@ static bool TryResolveInstallSkillTargets(string targetValue, out IReadOnlyList<
     return false;
 }
 
-static string BuildInstallSkillContent(string helpOutput, string examplesOutput, string simpleSchemaOutput, string simpleSchemaSourceCommand)
+static string BuildInstallSkillContent(string examplesOutput, string simpleSchemaOutput, string simpleSchemaSourceCommand)
 {
     return $$"""
 ---
 name: langquery
-description: Query C# codebases with LangQuery using read-only SQL over `v1_*` views and `meta_*` metadata.
+description: Analyze C# codebases with structured SQL facts instead of grep and other token-heavy text search.
 ---
 
 # LangQuery Skill
 
 ## Quick summary
-LangQuery indexes a C# solution into a local SQLite database and exposes stable `v1_*` views plus `meta_*` metadata so AI agents can answer codebase questions with read-only SQL.
+LangQuery scans a C# solution into a local SQLite database, then lets you answer code questions using read-only SQL over stable `v1_*` views and `meta_*` metadata.
 
-## Command line parameters (`langquery help --pretty`)
-```json
-{{helpOutput}}
-```
+## When to use this skill
+- You need fast, repo-wide facts (for example: where symbols are declared/used, method/type inventories, hotspots, counts, relationships).
+- You want deterministic, auditable answers backed by SQL rows instead of heuristic text search.
+- You need to explore large codebases efficiently before deciding which files to open in detail.
+
+## When not to use this skill
+- You already know the exact file/line to inspect; read the file directly instead.
+- You need to modify code, run tests, or perform non-SQL tasks; this skill is for analysis/querying only.
+- You need runtime behavior that static indexing cannot prove (for example live config values, production-only state).
+
+Run `langquery help` for a full command list, but in the common case you should not need it. If there is exactly one `.sln` in the current project, the best workflow is: run `langquery scan` after initial setup or code changes, then run `langquery "<sql>"` for queries.
 
 ## Usage examples (`langquery examples --pretty`)
 ```json
@@ -537,6 +537,16 @@ LangQuery indexes a C# solution into a local SQLite database and exposes stable 
 - Keep SQL read-only (`SELECT`, `WITH`, `EXPLAIN`) and set `--max-rows`/`--timeout-ms` for predictable results.
 - Start with broad discovery queries (`COUNT`, grouped summaries, `LIMIT`) before deep joins.
 - Use `langquery simpleschema --solution <folder-or-.sln> --db <path> --pretty` to refresh field names and known constants.
+
+## Simple schema legend
+- `SchemaVersion`: public schema contract version.
+- `Entities`: map of `<table_or_view_name>` to grouped field arrays.
+- `text_fields`: use for `LIKE`, equality, and grouping filters.
+- `numeric_fields`: use for range filters, sorting, and aggregations.
+- `boolean_fields`: boolean-like fields (`0/1` or true/false semantics).
+- `blob_fields`: binary payload fields; avoid unless explicitly needed.
+- `other_fields`: fields that do not match the common SQLite affinities above.
+- `Constants`: map of `<table.column>` to known literal values for safe predicates.
 
 ## Current simple schema description (`{{simpleSchemaSourceCommand}}`)
 ```json
@@ -639,167 +649,108 @@ static string EscapeSqliteIdentifier(string value)
 static SimpleSchemaPayload BuildSimpleSchema(SchemaDescription schema)
 {
     var entities = schema.Entities
-        .Select(entity => new SimpleSchemaEntity(
-            entity.Name,
-            entity.Kind,
-            entity.Columns
-                .Select(column => new SimpleSchemaColumn(column.Name, column.Type))
-                .ToArray()))
-        .ToArray();
+        .OrderBy(entity => entity.Name, StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(
+            entity => entity.Name,
+            entity => BuildSimpleSchemaFieldBuckets(entity.Columns),
+            StringComparer.OrdinalIgnoreCase);
 
-    var constants = BuildKnownQueryConstants(entities);
+    var constants = BuildKnownQueryConstants(schema.Entities)
+        .OrderBy(constant => constant.Location, StringComparer.OrdinalIgnoreCase)
+        .ToDictionary(
+            constant => constant.Location,
+            constant => (IReadOnlyList<string>)constant.Values,
+            StringComparer.OrdinalIgnoreCase);
+
     return new SimpleSchemaPayload(schema.SchemaVersion, entities, constants);
 }
 
-static IReadOnlyList<SimpleSchemaConstant> BuildKnownQueryConstants(IReadOnlyList<SimpleSchemaEntity> entities)
+static IReadOnlyDictionary<string, IReadOnlyList<string>> BuildSimpleSchemaFieldBuckets(IReadOnlyList<SchemaColumn> columns)
+{
+    var buckets = new Dictionary<string, List<string>>(StringComparer.OrdinalIgnoreCase);
+
+    foreach (var column in columns)
+    {
+        var bucketName = ClassifySimpleSchemaBucket(column.Type);
+        if (!buckets.TryGetValue(bucketName, out var names))
+        {
+            names = new List<string>();
+            buckets[bucketName] = names;
+        }
+
+        names.Add(column.Name);
+    }
+
+    var orderedBuckets = new Dictionary<string, IReadOnlyList<string>>(StringComparer.OrdinalIgnoreCase);
+    foreach (var bucketName in new[] { "text_fields", "numeric_fields", "boolean_fields", "blob_fields", "other_fields" })
+    {
+        if (buckets.TryGetValue(bucketName, out var names) && names.Count > 0)
+        {
+            orderedBuckets[bucketName] = names;
+        }
+    }
+
+    return orderedBuckets;
+}
+
+static string ClassifySimpleSchemaBucket(string sqliteType)
+{
+    var normalized = sqliteType.Trim().ToUpperInvariant();
+    var parenthesisStart = normalized.IndexOf('(', StringComparison.Ordinal);
+    if (parenthesisStart > 0)
+    {
+        normalized = normalized[..parenthesisStart];
+    }
+
+    if (normalized.Contains("CHAR", StringComparison.Ordinal)
+        || normalized.Contains("CLOB", StringComparison.Ordinal)
+        || normalized.Contains("TEXT", StringComparison.Ordinal))
+    {
+        return "text_fields";
+    }
+
+    if (normalized.Contains("BOOL", StringComparison.Ordinal))
+    {
+        return "boolean_fields";
+    }
+
+    if (normalized.Contains("INT", StringComparison.Ordinal)
+        || normalized.Contains("REAL", StringComparison.Ordinal)
+        || normalized.Contains("FLOA", StringComparison.Ordinal)
+        || normalized.Contains("DOUB", StringComparison.Ordinal)
+        || normalized.Contains("NUMERIC", StringComparison.Ordinal)
+        || normalized.Contains("DECIMAL", StringComparison.Ordinal))
+    {
+        return "numeric_fields";
+    }
+
+    if (normalized.Contains("BLOB", StringComparison.Ordinal))
+    {
+        return "blob_fields";
+    }
+
+    return "other_fields";
+}
+
+static IReadOnlyList<SimpleSchemaConstant> BuildKnownQueryConstants(IReadOnlyList<SchemaEntity> entities)
 {
     var candidates = new[]
     {
-        new SimpleSchemaConstant(
-            "v1_files.language",
-            "Filter by source language.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("csharp", "C# source files indexed by the current extractor.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_types.kind",
-            "Filter by declaration type category.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Class", "class declarations."),
-                new SimpleSchemaKnownValue("Struct", "struct declarations."),
-                new SimpleSchemaKnownValue("Interface", "interface declarations."),
-                new SimpleSchemaKnownValue("Record", "record declarations."),
-                new SimpleSchemaKnownValue("Enum", "enum declarations.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_types.access_modifier",
-            "Filter type declarations by effective access level.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Public", "Publicly accessible type declaration."),
-                new SimpleSchemaKnownValue("Internal", "Assembly-scoped type declaration."),
-                new SimpleSchemaKnownValue("Private", "Nested private type declaration."),
-                new SimpleSchemaKnownValue("Protected", "Nested protected type declaration."),
-                new SimpleSchemaKnownValue("ProtectedInternal", "Nested protected internal type declaration."),
-                new SimpleSchemaKnownValue("PrivateProtected", "Nested private protected type declaration."),
-                new SimpleSchemaKnownValue("File", "File-local type declaration.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_types.modifiers",
-            "Comma-separated non-access declaration modifiers for types.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Abstract", "Type has the abstract modifier."),
-                new SimpleSchemaKnownValue("Sealed", "Type has the sealed modifier."),
-                new SimpleSchemaKnownValue("Static", "Type has the static modifier."),
-                new SimpleSchemaKnownValue("Partial", "Type has the partial modifier."),
-                new SimpleSchemaKnownValue("ReadOnly", "Type has the readonly modifier (for structs)."),
-                new SimpleSchemaKnownValue("Ref", "Type has the ref modifier (for ref structs).")
-            }),
-        new SimpleSchemaConstant(
-            "v1_type_inheritances.relation_kind",
-            "Filter inheritance edges by relation kind.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("BaseType", "The inherited class/base type."),
-                new SimpleSchemaKnownValue("Interface", "An implemented interface (or struct interface)."),
-                new SimpleSchemaKnownValue("BaseInterface", "An interface inheriting another interface.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_variables.kind",
-            "Filter by how the variable is introduced in a method.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Parameter", "Method or constructor parameter."),
-                new SimpleSchemaKnownValue("Local", "Local variable declaration."),
-                new SimpleSchemaKnownValue("ForEach", "foreach loop variable."),
-                new SimpleSchemaKnownValue("Catch", "catch exception variable.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_symbol_refs.symbol_kind",
-            "Filter coarse symbol-reference categories.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Variable", "Identifier resolved to a known variable in the method scope."),
-                new SimpleSchemaKnownValue("Method", "Identifier used as an invoked method name."),
-                new SimpleSchemaKnownValue("Property", "Identifier used as a member/property access (non-invocation)."),
-                new SimpleSchemaKnownValue("Identifier", "Any other identifier usage.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_methods.return_type",
-            "Constructor rows use a predefined marker.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("ctor", "Constructor methods (not regular methods).")
-            }),
-        new SimpleSchemaConstant(
-            "v1_methods.access_modifier",
-            "Filter method and nested implementation rows by effective access level.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Public", "Public method/member declaration."),
-                new SimpleSchemaKnownValue("Internal", "Internal method/member declaration."),
-                new SimpleSchemaKnownValue("Private", "Private method/member declaration."),
-                new SimpleSchemaKnownValue("Protected", "Protected method/member declaration."),
-                new SimpleSchemaKnownValue("ProtectedInternal", "Protected internal method/member declaration."),
-                new SimpleSchemaKnownValue("PrivateProtected", "Private protected method/member declaration."),
-                new SimpleSchemaKnownValue("Local", "Local function, lambda, or anonymous method.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_methods.modifiers",
-            "Comma-separated non-access declaration modifiers for method rows.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Abstract", "Method has the abstract modifier."),
-                new SimpleSchemaKnownValue("Virtual", "Method has the virtual modifier."),
-                new SimpleSchemaKnownValue("Override", "Method has the override modifier."),
-                new SimpleSchemaKnownValue("Sealed", "Method has the sealed modifier."),
-                new SimpleSchemaKnownValue("Static", "Method has the static modifier."),
-                new SimpleSchemaKnownValue("Async", "Method has the async modifier.")
-            }),
-        new SimpleSchemaConstant(
-            "v1_methods.implementation_kind",
-            "Distinguish top-level methods from nested implementation forms.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("Method", "Regular method declaration."),
-                new SimpleSchemaKnownValue("Constructor", "Constructor declaration."),
-                new SimpleSchemaKnownValue("LocalFunction", "Nested local function declaration."),
-                new SimpleSchemaKnownValue("Lambda", "Lambda expression implementation."),
-                new SimpleSchemaKnownValue("AnonymousMethod", "delegate(...) anonymous method implementation.")
-            }),
-        new SimpleSchemaConstant(
-            "meta_capabilities.key",
-            "Capability keys available for filtering metadata.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("sql_mode", "Read-only SQL mode metadata key."),
-                new SimpleSchemaKnownValue("public_views", "Public schema version metadata key."),
-                new SimpleSchemaKnownValue("languages", "Supported language metadata key.")
-            }),
-        new SimpleSchemaConstant(
-            "meta_capabilities.value (key = 'sql_mode')",
-            "Known values when key is 'sql_mode'.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("read-only", "Only read-oriented SQL statements are allowed.")
-            }),
-        new SimpleSchemaConstant(
-            "meta_capabilities.value (key = 'public_views')",
-            "Known values when key is 'public_views'.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("v1", "Public query surface version.")
-            }),
-        new SimpleSchemaConstant(
-            "meta_capabilities.value (key = 'languages')",
-            "Known values when key is 'languages'.",
-            new[]
-            {
-                new SimpleSchemaKnownValue("csharp", "Current extractor language support.")
-            })
+        new SimpleSchemaConstant("v1_files.language", ["csharp"]),
+        new SimpleSchemaConstant("v1_types.kind", ["Class", "Struct", "Interface", "Record", "Enum"]),
+        new SimpleSchemaConstant("v1_types.access_modifier", ["Public", "Internal", "Private", "Protected", "ProtectedInternal", "PrivateProtected", "File"]),
+        new SimpleSchemaConstant("v1_types.modifiers", ["Abstract", "Sealed", "Static", "Partial", "ReadOnly", "Ref"]),
+        new SimpleSchemaConstant("v1_type_inheritances.relation_kind", ["BaseType", "Interface", "BaseInterface"]),
+        new SimpleSchemaConstant("v1_variables.kind", ["Parameter", "Local", "ForEach", "Catch"]),
+        new SimpleSchemaConstant("v1_symbol_refs.symbol_kind", ["Variable", "Method", "Property", "Identifier"]),
+        new SimpleSchemaConstant("v1_methods.return_type", ["ctor"]),
+        new SimpleSchemaConstant("v1_methods.access_modifier", ["Public", "Internal", "Private", "Protected", "ProtectedInternal", "PrivateProtected", "Local"]),
+        new SimpleSchemaConstant("v1_methods.modifiers", ["Abstract", "Virtual", "Override", "Sealed", "Static", "Async"]),
+        new SimpleSchemaConstant("v1_methods.implementation_kind", ["Method", "Constructor", "LocalFunction", "Lambda", "AnonymousMethod"]),
+        new SimpleSchemaConstant("meta_capabilities.key", ["sql_mode", "public_views", "languages"]),
+        new SimpleSchemaConstant("meta_capabilities.value (key = 'sql_mode')", ["read-only"]),
+        new SimpleSchemaConstant("meta_capabilities.value (key = 'public_views')", ["v1"]),
+        new SimpleSchemaConstant("meta_capabilities.value (key = 'languages')", ["csharp"])
     };
 
     return candidates
@@ -807,7 +758,7 @@ static IReadOnlyList<SimpleSchemaConstant> BuildKnownQueryConstants(IReadOnlyLis
         .ToArray();
 }
 
-static bool IsConstantRelevantToSchema(string location, IReadOnlyList<SimpleSchemaEntity> entities)
+static bool IsConstantRelevantToSchema(string location, IReadOnlyList<SchemaEntity> entities)
 {
     var baseLocation = location;
     var conditionStart = location.IndexOf(' ', StringComparison.Ordinal);
@@ -1094,8 +1045,8 @@ static object BuildExamplesPayload()
         new
         {
             title = "Methods with highest parameter arity",
-            query = "SELECT file_path, name AS method_name, parameter_count, parameters FROM v1_methods WHERE implementation_kind IN ('Method', 'Constructor', 'LocalFunction') ORDER BY parameter_count DESC, file_path, method_name LIMIT 25",
-            explanation = "Surfaces high-arity methods with parameter signatures so you can spot refactor candidates and verify call-shape assumptions."
+            query = "SELECT m.file_path, m.name AS method_name, COUNT(v.variable_id) AS parameter_count, m.parameters FROM v1_methods m LEFT JOIN v1_variables v ON v.method_id = m.method_id AND v.kind = 'Parameter' WHERE m.implementation_kind IN ('Method', 'Constructor', 'LocalFunction') GROUP BY m.method_id, m.file_path, m.name, m.parameters ORDER BY parameter_count DESC, m.file_path, method_name LIMIT 25",
+            explanation = "Surfaces high-arity methods by computing parameter counts from variable facts, then pairing them with parameter signatures."
         },
         new
         {
@@ -1136,8 +1087,8 @@ static object BuildExamplesPayload()
         new
         {
             title = "Variable-dense lines",
-            query = "SELECT file_path, line_number, variable_count, text FROM v1_lines WHERE variable_count >= 3 ORDER BY variable_count DESC, file_path, line_number LIMIT 50",
-            explanation = "Lists lines with heavy variable usage, a useful signal for readability and complexity review."
+            query = "SELECT l.file_path, l.line_number, COUNT(DISTINCT lv.variable_id) AS variable_count, l.text FROM v1_lines l JOIN v1_line_variables lv ON lv.line_id = l.line_id GROUP BY l.line_id, l.file_path, l.line_number, l.text HAVING COUNT(DISTINCT lv.variable_id) >= 3 ORDER BY variable_count DESC, l.file_path, l.line_number LIMIT 50",
+            explanation = "Lists lines with heavy variable usage by deriving line-level counts from line-variable links."
         }
     };
 }
@@ -1374,23 +1325,9 @@ internal sealed record DatabaseExportEntity(
 
 internal sealed record SimpleSchemaPayload(
     int SchemaVersion,
-    IReadOnlyList<SimpleSchemaEntity> Entities,
-    IReadOnlyList<SimpleSchemaConstant> Constants);
-
-internal sealed record SimpleSchemaEntity(
-    string Name,
-    string Kind,
-    IReadOnlyList<SimpleSchemaColumn> Columns);
-
-internal sealed record SimpleSchemaColumn(
-    string Name,
-    string Type);
+    IReadOnlyDictionary<string, IReadOnlyDictionary<string, IReadOnlyList<string>>> Entities,
+    IReadOnlyDictionary<string, IReadOnlyList<string>> Constants);
 
 internal sealed record SimpleSchemaConstant(
     string Location,
-    string Usage,
-    IReadOnlyList<SimpleSchemaKnownValue> Values);
-
-internal sealed record SimpleSchemaKnownValue(
-    string Value,
-    string Meaning);
+    IReadOnlyList<string> Values);
