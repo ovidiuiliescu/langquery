@@ -58,6 +58,135 @@ Sample screenshots:
 2. `langquery installskill <target>` to refresh the skill after an upgrade.
 3. Ask the agent to answer with SQL evidence and returned rows.
 
+### Advanced coding-agent example (constraint-heavy)
+
+Prompt:
+
+```text
+How many usages of:
+
+- a property whose name ends with "eters"
+- whose type name starts with "Sq"
+
+Occur on:
+
+- a line where a Dictionary value or variable is also used
+- the dictionary has a value type of long.
+
+Show me the query and each of the usages.
+```
+
+Query used by the agent:
+
+```sql
+WITH prop_refs AS (
+    SELECT
+        sr.file_path,
+        sr.method_key,
+        sr.line_number,
+        sr.symbol_name,
+        sr.symbol_type_name
+    FROM v1_symbol_refs sr
+    WHERE sr.symbol_kind = 'Property'
+      AND sr.symbol_name LIKE '%eters'
+      AND LOWER(COALESCE(sr.symbol_type_name, '')) LIKE 'sq%'
+),
+dict_vars_on_line AS (
+    SELECT DISTINCT
+        lv.file_path,
+        lv.method_key,
+        lv.line_number,
+        v.name AS dict_variable_name,
+        v.type_name AS dict_variable_type
+    FROM v1_line_variables lv
+    JOIN v1_variables v ON v.variable_id = lv.variable_id
+    WHERE LOWER(COALESCE(v.type_name, '')) LIKE '%dictionary<%, long>%'
+       OR LOWER(COALESCE(v.type_name, '')) LIKE '%dictionary<%,long>%'
+       OR LOWER(COALESCE(v.type_name, '')) LIKE '%dictionary<%, system.int64>%'
+       OR LOWER(COALESCE(v.type_name, '')) LIKE '%dictionary<%,system.int64>%'
+)
+SELECT
+    p.file_path,
+    p.line_number,
+    m.name AS method_name,
+    p.symbol_name AS property_name,
+    p.symbol_type_name AS property_type_name,
+    d.dict_variable_name,
+    d.dict_variable_type,
+    l.text AS line_text
+FROM prop_refs p
+JOIN dict_vars_on_line d
+    ON d.file_path = p.file_path
+   AND d.line_number = p.line_number
+   AND (d.method_key = p.method_key OR (d.method_key IS NULL AND p.method_key IS NULL))
+LEFT JOIN v1_methods m ON m.method_key = p.method_key
+LEFT JOIN v1_lines l
+    ON l.file_path = p.file_path
+   AND l.line_number = p.line_number
+   AND (l.method_key = p.method_key OR (l.method_key IS NULL AND p.method_key IS NULL))
+ORDER BY p.file_path, p.line_number;
+```
+
+Sample findings (2 usages found):
+
+- `src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs:324` in `InsertMethodsAsync` (`command.Parameters` + `typeIds : IReadOnlyDictionary<string, long>`)
+- `src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs:379` in `InsertLinesAsync` (`command.Parameters` + `methodIds : IReadOnlyDictionary<string, long>`)
+
+Why this is a strong agent example:
+
+- It translates fuzzy natural-language constraints into explicit SQL predicates.
+- It combines symbol refs, variables, methods, and source lines to produce evidence-rich answers.
+- It returns both the exact query and concrete line-level usages, so results are auditable and repeatable.
+
+### Advanced coding-agent example (file complexity ranking)
+
+Prompt:
+
+```text
+Sort all files by average variable density per line of code. Show results and query.
+```
+
+Query used by the agent:
+
+```sql
+SELECT
+  file_path,
+  COUNT(*) AS line_count,
+  SUM(variable_count) AS total_variable_mentions,
+  ROUND(AVG(CAST(variable_count AS REAL)), 4) AS avg_variable_density
+FROM v1_lines
+GROUP BY file_path
+ORDER BY avg_variable_density DESC, line_count DESC, file_path;
+```
+
+Sample results (sorted by average variable density per line):
+
+| file | lines | total vars | avg density |
+|---|---:|---:|---:|
+| src/LangQuery.Storage.Sqlite/Storage/SqliteStorageEngine.cs | 822 | 596 | 0.7251 |
+| src/LangQuery.Core/Services/LangQueryService.cs | 518 | 255 | 0.4923 |
+| src/LangQuery.Query/Validation/ReadOnlySqlSafetyValidator.cs | 237 | 116 | 0.4895 |
+| src/LangQuery.Roslyn/Extraction/CSharpCodeFactsExtractor.cs | 1089 | 474 | 0.4353 |
+| tests/LangQuery.IntegrationTests/CliUsabilityTests.cs | 1228 | 526 | 0.4283 |
+| tests/LangQuery.IntegrationTests/EndToEndTests.cs | 700 | 267 | 0.3814 |
+| tests/LangQuery.UnitTests/UnitTest1.cs | 931 | 340 | 0.3652 |
+| tests/LangQuery.UnitTests/LangQueryServiceTests.cs | 747 | 258 | 0.3454 |
+| tests/LangQuery.UnitTests/CSharpCodeFactsExtractorTests.cs | 611 | 152 | 0.2488 |
+| tests/LangQuery.UnitTests/ReadOnlySqlSafetyValidatorTests.cs | 169 | 31 | 0.1834 |
+| src/LangQuery.Core/Models/Results.cs | 40 | 1 | 0.0250 |
+| src/LangQuery.Cli/Program.cs | 1397 | 0 | 0.0000 |
+| src/LangQuery.Core/Models/Facts.cs | 83 | 0 | 0.0000 |
+| src/LangQuery.Core/Abstractions/IStorageEngine.cs | 26 | 0 | 0.0000 |
+| src/LangQuery.Core/Abstractions/ICodeFactsExtractor.cs | 11 | 0 | 0.0000 |
+| src/LangQuery.Core/Abstractions/ISqlSafetyValidator.cs | 9 | 0 | 0.0000 |
+| src/LangQuery.Core/Models/Options.cs | 8 | 0 | 0.0000 |
+
+Why this is useful:
+
+- It gives a fast, project-wide complexity signal for prioritizing review/refactoring.
+- It combines raw size (`line_count`) with density (`avg_variable_density`) for better triage.
+- It is deterministic and easy to rerun after a scan to track complexity drift over time.
+
 ## Quick useful commands (first)
 
 These assume that `langquery` is already installed (steps to install are described below):
@@ -85,13 +214,30 @@ Sample output (trimmed):
 ### 2) Find high-risk large methods quickly
 
 ```bash
-langquery "SELECT file_path, name AS method_name, (line_end - line_start + 1) AS line_span FROM v1_methods ORDER BY line_span DESC LIMIT 20"
+langquery "
+SELECT
+  file_path,
+  name AS method_name,
+  (line_end - line_start + 1) AS line_span
+FROM v1_methods
+ORDER BY line_span DESC
+LIMIT 20
+"
 ```
 
 ### 3) Spot invocation hotspots
 
 ```bash
-langquery "SELECT file_path, target_name, COUNT(*) AS call_count FROM v1_invocations GROUP BY file_path, target_name ORDER BY call_count DESC, file_path, target_name LIMIT 15"
+langquery "
+SELECT
+  file_path,
+  target_name,
+  COUNT(*) AS call_count
+FROM v1_invocations
+GROUP BY file_path, target_name
+ORDER BY call_count DESC, file_path, target_name
+LIMIT 15
+"
 ```
 
 This is a fast way to find high-traffic calls and likely coupling hotspots.
@@ -99,7 +245,17 @@ This is a fast way to find high-traffic calls and likely coupling hotspots.
 ### 4) Find dense lines that are hard to read
 
 ```bash
-langquery "SELECT file_path, line_number, variable_count, text FROM v1_lines WHERE variable_count >= 3 ORDER BY variable_count DESC, file_path, line_number LIMIT 25"
+langquery "
+SELECT
+  file_path,
+  line_number,
+  variable_count,
+  text
+FROM v1_lines
+WHERE variable_count >= 3
+ORDER BY variable_count DESC, file_path, line_number
+LIMIT 25
+"
 ```
 
 Great for quickly identifying lines worth simplification/refactoring.
@@ -107,7 +263,16 @@ Great for quickly identifying lines worth simplification/refactoring.
 ### 5) Track local functions and lambdas
 
 ```bash
-langquery "SELECT file_path, name, implementation_kind, parent_method_key FROM v1_methods WHERE implementation_kind IN ('LocalFunction', 'Lambda', 'AnonymousMethod') ORDER BY file_path, implementation_kind, name"
+langquery "
+SELECT
+  file_path,
+  name,
+  implementation_kind,
+  parent_method_key
+FROM v1_methods
+WHERE implementation_kind IN ('LocalFunction', 'Lambda', 'AnonymousMethod')
+ORDER BY file_path, implementation_kind, name
+"
 ```
 
 Useful when you need to understand nested behavior boundaries.
@@ -150,43 +315,122 @@ Assume your current directory is a solution folder, or pass `--solution` explici
 ### Inheritance graph
 
 ```bash
-langquery "SELECT type_name, base_type_name, relation_kind FROM v1_type_inheritances ORDER BY type_name, base_type_name"
+langquery "
+SELECT
+  type_name,
+  base_type_name,
+  relation_kind
+FROM v1_type_inheritances
+ORDER BY type_name, base_type_name
+"
 ```
 
 ### Invocation hotspots inside a hierarchy
 
 ```bash
-langquery "SELECT t.name AS class_name, i.target_name, COUNT(*) AS call_count FROM v1_invocations i JOIN v1_methods m ON m.method_id = i.method_id JOIN v1_types t ON t.type_id = m.type_id JOIN v1_type_inheritances ti ON ti.type_id = t.type_id WHERE ti.base_type_name IN ('ComputationBase', 'RevenueCalculator') GROUP BY t.name, i.target_name ORDER BY call_count DESC, class_name, target_name LIMIT 10"
+langquery "
+SELECT
+  t.name AS class_name,
+  i.target_name,
+  COUNT(*) AS call_count
+FROM v1_invocations i
+JOIN v1_methods m ON m.method_id = i.method_id
+JOIN v1_types t ON t.type_id = m.type_id
+JOIN v1_type_inheritances ti ON ti.type_id = t.type_id
+WHERE ti.base_type_name IN ('ComputationBase', 'RevenueCalculator')
+GROUP BY t.name, i.target_name
+ORDER BY call_count DESC, class_name, target_name
+LIMIT 10
+"
 ```
 
 ### `sumOf*` integer references by line
 
 ```bash
-langquery "SELECT l.file_path, l.line_number, lv.variable_name, v.type_name AS variable_type, t.name AS class_name FROM v1_line_variables lv JOIN v1_variables v ON v.variable_id = lv.variable_id JOIN v1_lines l ON l.line_id = lv.line_id JOIN v1_methods m ON m.method_id = l.method_id JOIN v1_types t ON t.type_id = m.type_id JOIN v1_type_inheritances ti ON ti.type_id = t.type_id WHERE lv.variable_name LIKE 'sumOf%' AND LOWER(COALESCE(v.type_name, '')) IN ('int', 'int32', 'system.int32') AND ti.base_type_name IN ('ComputationBase', 'RevenueCalculator') ORDER BY l.file_path, l.line_number"
+langquery "
+SELECT
+  l.file_path,
+  l.line_number,
+  lv.variable_name,
+  v.type_name AS variable_type,
+  t.name AS class_name
+FROM v1_line_variables lv
+JOIN v1_variables v ON v.variable_id = lv.variable_id
+JOIN v1_lines l ON l.line_id = lv.line_id
+JOIN v1_methods m ON m.method_id = l.method_id
+JOIN v1_types t ON t.type_id = m.type_id
+JOIN v1_type_inheritances ti ON ti.type_id = t.type_id
+WHERE lv.variable_name LIKE 'sumOf%'
+  AND LOWER(COALESCE(v.type_name, '')) IN ('int', 'int32', 'system.int32')
+  AND ti.base_type_name IN ('ComputationBase', 'RevenueCalculator')
+ORDER BY l.file_path, l.line_number
+"
 ```
 
 ### Nested implementations with parent linkage
 
 ```bash
-langquery "SELECT file_path, name, implementation_kind, access_modifier, parent_method_key FROM v1_methods WHERE implementation_kind IN ('LocalFunction', 'Lambda', 'AnonymousMethod') ORDER BY file_path, implementation_kind, name"
+langquery "
+SELECT
+  file_path,
+  name,
+  implementation_kind,
+  access_modifier,
+  parent_method_key
+FROM v1_methods
+WHERE implementation_kind IN ('LocalFunction', 'Lambda', 'AnonymousMethod')
+ORDER BY file_path, implementation_kind, name
+"
 ```
 
 ### High-arity methods with parameter signatures
 
 ```bash
-langquery "SELECT file_path, name, parameter_count, parameters FROM v1_methods WHERE implementation_kind IN ('Method', 'Constructor', 'LocalFunction') ORDER BY parameter_count DESC, file_path, name LIMIT 25"
+langquery "
+SELECT
+  file_path,
+  name,
+  parameter_count,
+  parameters
+FROM v1_methods
+WHERE implementation_kind IN ('Method', 'Constructor', 'LocalFunction')
+ORDER BY parameter_count DESC, file_path, name
+LIMIT 25
+"
 ```
 
 ### Distinguish property access vs method calls
 
 ```bash
-langquery "SELECT file_path, symbol_name, symbol_kind, COUNT(*) AS reference_count FROM v1_symbol_refs WHERE symbol_kind IN ('Property', 'Method') GROUP BY file_path, symbol_name, symbol_kind ORDER BY reference_count DESC, file_path, symbol_name LIMIT 50"
+langquery "
+SELECT
+  file_path,
+  symbol_name,
+  symbol_kind,
+  COUNT(*) AS reference_count
+FROM v1_symbol_refs
+WHERE symbol_kind IN ('Property', 'Method')
+GROUP BY file_path, symbol_name, symbol_kind
+ORDER BY reference_count DESC, file_path, symbol_name
+LIMIT 50
+"
 ```
 
 ### Abstract/sealed declarations
 
 ```bash
-langquery "SELECT file_path, name, kind, access_modifier, modifiers FROM v1_types WHERE modifiers LIKE '%Abstract%' OR modifiers LIKE '%Sealed%' ORDER BY file_path, name"
+langquery "
+SELECT
+  file_path,
+  name,
+  kind,
+  access_modifier,
+  modifiers
+FROM v1_types
+WHERE modifiers LIKE '%Abstract%'
+   OR modifiers LIKE '%Sealed%'
+ORDER BY file_path, name
+"
 ```
 
 ## Install (if you do not have `langquery` yet)
@@ -246,7 +490,10 @@ What it does:
 How it looks:
 
 ```bash
-langquery "SELECT COUNT(*) AS method_count FROM v1_methods"
+langquery "
+SELECT COUNT(*) AS method_count
+FROM v1_methods
+"
 ```
 
 Small sample output:
@@ -326,7 +573,11 @@ What it does:
 How it looks:
 
 ```bash
-langquery sql --query "SELECT file_path FROM v1_files LIMIT 5" --pretty
+langquery sql --query "
+SELECT file_path
+FROM v1_files
+LIMIT 5
+" --pretty
 ```
 
 Small sample output:
@@ -353,7 +604,11 @@ What it does:
 How it looks:
 
 ```bash
-langquery sql --query "SELECT file_path FROM v1_files ORDER BY file_path" --max-rows 1 --pretty
+langquery sql --query "
+SELECT file_path
+FROM v1_files
+ORDER BY file_path
+" --max-rows 1 --pretty
 ```
 
 Small sample output:
@@ -379,7 +634,10 @@ What it does:
 How it looks:
 
 ```bash
-langquery sql --query "SELECT COUNT(*) AS method_count FROM v1_methods" --timeout-ms 15000 --pretty
+langquery sql --query "
+SELECT COUNT(*) AS method_count
+FROM v1_methods
+" --timeout-ms 15000 --pretty
 ```
 
 Small sample output:
