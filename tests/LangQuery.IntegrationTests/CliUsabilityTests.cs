@@ -294,7 +294,7 @@ public sealed class CliUsabilityTests
             Assert.Equal(0, result.ExitCode);
             Assert.True(payload.GetProperty("success").GetBoolean());
             Assert.True(File.Exists(databasePath));
-            Assert.Equal(0, ReadSingleCount(payload));
+            Assert.True(ReadSingleCount(payload) >= 1);
         }
         finally
         {
@@ -542,6 +542,252 @@ public sealed class CliUsabilityTests
         }
     }
 
+    [Fact]
+    public async Task NoArgsInvocation_ReturnsHelpPayload()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot());
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.Equal("help", payload.GetProperty("command").GetString());
+        Assert.True(payload.GetProperty("success").GetBoolean());
+        Assert.True(HasPropertyIgnoreCase(payload, "data"));
+    }
+
+    [Fact]
+    public async Task BareWordToken_IsTreatedAsShortFormSqlAndFailsValidation()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "totally-unknown-command");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Equal("sql", payload.GetProperty("command").GetString());
+        Assert.Contains("Only SELECT, WITH, or EXPLAIN", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SqlCommand_WithoutQueryOption_ReturnsError()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "sql");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Missing required option '--query <sql>'", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SqlCommand_InvalidMaxRowsValue_ReturnsError()
+    {
+        var sampleRoot = GetSampleSolutionRoot();
+        var result = await RunCliAsync(sampleRoot, "sql", "--query", "SELECT 1 AS n", "--max-rows", "0");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("--max-rows", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SqlCommand_InvalidTimeoutValue_ReturnsError()
+    {
+        var sampleRoot = GetSampleSolutionRoot();
+        var result = await RunCliAsync(sampleRoot, "sql", "--query", "SELECT 1 AS n", "--timeout-ms", "-5");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("--timeout-ms", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ScanCommand_WithNonexistentSolutionPath_ReturnsError()
+    {
+        var missingPath = Path.Combine(Path.GetTempPath(), "langquery-missing-sln", Guid.NewGuid().ToString("N"));
+        var result = await RunCliAsync(GetRepositoryRoot(), "scan", "--solution", missingPath);
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("does not exist", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ScanCommand_WithNonSolutionFilePath_ReturnsError()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-not-sln", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        var plainFile = Path.Combine(tempDirectory, "notes.txt");
+        await File.WriteAllTextAsync(plainFile, "not a solution", CancellationToken.None);
+
+        try
+        {
+            var result = await RunCliAsync(GetRepositoryRoot(), "scan", "--solution", plainFile);
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(1, result.ExitCode);
+            Assert.False(payload.GetProperty("success").GetBoolean());
+            Assert.Contains("not a .sln", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task InstallSkillCommand_RejectsUnsupportedOption()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "installskill", "codex", "--db", "ignored.db");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Unsupported option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("--db", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task InstallSkillCommand_RejectsUnsupportedFlag()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "installskill", "codex", "--changed-only");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Unsupported option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("--changed-only", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task InstallSkillCommand_OpenCodeTarget_CreatesOnlyOpenCodeSkillFile()
+    {
+        var sampleRoot = CreateTemporarySampleSolutionCopy();
+
+        try
+        {
+            var result = await RunCliAsync(sampleRoot, "installskill", "opencode");
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+
+            var openCodePath = Path.Combine(sampleRoot, ".opencode", "skills", "langquery", "SKILL.md");
+            var codexPath = Path.Combine(sampleRoot, ".codex", "skills", "langquery", "SKILL.md");
+            var claudePath = Path.Combine(sampleRoot, ".claude", "skills", "langquery", "SKILL.md");
+
+            Assert.True(File.Exists(openCodePath));
+            Assert.False(File.Exists(codexPath));
+            Assert.False(File.Exists(claudePath));
+        }
+        finally
+        {
+            Directory.Delete(sampleRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SchemaCommand_WithExplicitDatabasePath_WorksWithoutSolutionOption()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-schema-db", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        var dbPath = Path.Combine(tempDirectory, "schema.db.sqlite");
+        DeleteDatabaseFiles(dbPath);
+
+        try
+        {
+            var result = await RunCliAsync(GetRepositoryRoot(), "schema", "--db", dbPath);
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+            Assert.Equal("schema", payload.GetProperty("command").GetString());
+
+            var entities = GetPropertyIgnoreCase(GetPropertyIgnoreCase(payload, "data"), "entities")
+                .EnumerateArray()
+                .ToArray();
+            Assert.NotEmpty(entities);
+        }
+        finally
+        {
+            DeleteDatabaseFiles(dbPath);
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ShortFormQuery_WithTrailingOptions_ParsesQueryAndRunsSuccessfully()
+    {
+        var sampleRoot = GetSampleSolutionRoot();
+        var databasePath = Path.Combine(sampleRoot, ".langquery.SampleSolution.db.sqlite");
+        DeleteDatabaseFiles(databasePath);
+
+        try
+        {
+            var result = await RunCliAsync(sampleRoot, "SELECT COUNT(*) AS c FROM v1_files", "--max-rows", "1");
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+            Assert.Equal("sql", payload.GetProperty("command").GetString());
+            Assert.True(ReadSingleCount(payload) >= 1);
+        }
+        finally
+        {
+            DeleteDatabaseFiles(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task ExplicitEmptySolutionFile_IsSupportedAndIndexesZeroFiles()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-empty-sln", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        var emptySolutionPath = Path.Combine(tempDirectory, "Empty.sln");
+        var databasePath = Path.Combine(tempDirectory, "empty.db.sqlite");
+        DeleteDatabaseFiles(databasePath);
+
+        WriteEmptySolution(emptySolutionPath);
+
+        try
+        {
+            var result = await RunCliAsync(
+                GetRepositoryRoot(),
+                "sql",
+                "--solution",
+                emptySolutionPath,
+                "--db",
+                databasePath,
+                "--query",
+                "SELECT COUNT(*) AS c FROM v1_files");
+
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+            Assert.Equal(0, ReadSingleCount(payload));
+        }
+        finally
+        {
+            DeleteDatabaseFiles(databasePath);
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task SqlCommand_WithMutationQuery_ReturnsValidationError()
+    {
+        var sampleRoot = GetSampleSolutionRoot();
+
+        var result = await RunCliAsync(sampleRoot, "sql", "--query", "DELETE FROM v1_files");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("read-only", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
     private static async Task<CliRunResult> RunCliAsync(string workingDirectory, params string[] args)
     {
         var cliDllPath = Path.Combine(GetRepositoryRoot(), "src", "LangQuery.Cli", "bin", "Debug", "net8.0", "LangQuery.Cli.dll");
@@ -724,6 +970,18 @@ public sealed class CliUsabilityTests
             MinimumVisualStudioVersion = 10.0.40219.1
             Project("{{{csharpProjectTypeGuid}}}") = "{{projectName}}", "{{relativeProjectPath}}", "{{{projectGuid}}}"
             EndProject
+            Global
+            EndGlobal
+            """);
+    }
+
+    private static void WriteEmptySolution(string solutionPath)
+    {
+        File.WriteAllText(solutionPath, """
+            Microsoft Visual Studio Solution File, Format Version 12.00
+            # Visual Studio Version 17
+            VisualStudioVersion = 17.0.31903.59
+            MinimumVisualStudioVersion = 10.0.40219.1
             Global
             EndGlobal
             """);

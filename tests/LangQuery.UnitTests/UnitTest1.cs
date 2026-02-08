@@ -2,6 +2,7 @@ using LangQuery.Core.Models;
 using LangQuery.Query.Validation;
 using LangQuery.Storage.Sqlite.Storage;
 using Microsoft.Data.Sqlite;
+using System.Globalization;
 
 namespace LangQuery.UnitTests;
 
@@ -101,9 +102,491 @@ public sealed class SqliteStorageEngineTests
         }
     }
 
+    [Fact]
+    public async Task InitializeAsync_CreatesParentDirectoryForDatabasePath()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var directory = Path.GetDirectoryName(databasePath);
+            Assert.NotNull(directory);
+            Assert.False(Directory.Exists(directory));
+
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            Assert.True(Directory.Exists(directory));
+            Assert.True(File.Exists(databasePath));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeAsync_IsIdempotentAndCapabilitiesRemainStable()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var result = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT key, value FROM meta_capabilities ORDER BY key", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Equal(3, result.Rows.Count);
+            Assert.Contains(result.Rows, row => Equals(row["key"], "languages") && Equals(row["value"], "csharp"));
+            Assert.Contains(result.Rows, row => Equals(row["key"], "public_views") && Equals(row["value"], "v1"));
+            Assert.Contains(result.Rows, row => Equals(row["key"], "sql_mode") && Equals(row["value"], "read-only"));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task GetIndexedFileHashesAsync_ReturnsEmptyAfterInitialization()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var hashes = await storage.GetIndexedFileHashesAsync(databasePath, CancellationToken.None);
+
+            Assert.Empty(hashes);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_FullRebuildReplacesPreviouslyIndexedFiles()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("First.cs", "HASH1")],
+                removedPaths: Array.Empty<string>(),
+                fullRebuild: true,
+                CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("Second.cs", "HASH2")],
+                removedPaths: Array.Empty<string>(),
+                fullRebuild: true,
+                CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT file_path FROM v1_files ORDER BY file_path", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Single(query.Rows);
+            Assert.Equal(Path.GetFullPath("Second.cs"), Convert.ToString(query.Rows[0]["file_path"], CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_ChangedOnlyRemovesDeletedPaths()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var firstPath = Path.GetFullPath("First.cs");
+            var secondPath = Path.GetFullPath("Second.cs");
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts(firstPath, "HASH1"), CreateSimpleFacts(secondPath, "HASH2")],
+                removedPaths: Array.Empty<string>(),
+                fullRebuild: true,
+                CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                facts: Array.Empty<FileFacts>(),
+                removedPaths: [firstPath],
+                fullRebuild: false,
+                CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT file_path FROM v1_files ORDER BY file_path", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Single(query.Rows);
+            Assert.Equal(secondPath, Convert.ToString(query.Rows[0]["file_path"], CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_UpsertsExistingFileHash()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var path = Path.GetFullPath("Tracked.cs");
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts(path, "OLD_HASH")],
+                removedPaths: Array.Empty<string>(),
+                fullRebuild: true,
+                CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts(path, "NEW_HASH")],
+                removedPaths: Array.Empty<string>(),
+                fullRebuild: false,
+                CancellationToken.None);
+
+            var hashes = await storage.GetIndexedFileHashesAsync(databasePath, CancellationToken.None);
+
+            Assert.Equal("NEW_HASH", hashes[path]);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_StoresScanStateValues()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("Tracked.cs", "HASH")],
+                removedPaths: [Path.GetFullPath("Removed.cs")],
+                fullRebuild: false,
+                CancellationToken.None);
+
+            var scanState = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT key, value FROM meta_scan_state ORDER BY key", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Contains(scanState.Rows, row => Equals(row["key"], "scanned_files") && Equals(row["value"], "1"));
+            Assert.Contains(scanState.Rows, row => Equals(row["key"], "removed_files") && Equals(row["value"], "1"));
+            Assert.Contains(scanState.Rows, row => Equals(row["key"], "last_scan_utc"));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_PersistsTypeInheritanceRows()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var facts = CreateSimpleFacts("Inheritance.cs", "HASH", includeInheritance: true);
+            await storage.PersistFactsAsync(databasePath, [facts], Array.Empty<string>(), fullRebuild: true, CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT type_name, base_type_name, relation_kind FROM v1_type_inheritances", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Contains(query.Rows, row =>
+                Equals(row["type_name"], "Widget")
+                && Equals(row["base_type_name"], "BaseWidget")
+                && Equals(row["relation_kind"], "BaseType"));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_PersistsNestedMethodsAndParentLinks()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var facts = CreateFactsWithNestedMethod("Nested.cs", "HASH");
+            await storage.PersistFactsAsync(databasePath, [facts], Array.Empty<string>(), fullRebuild: true, CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT implementation_kind, parent_method_key, access_modifier FROM v1_methods ORDER BY implementation_kind", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Contains(query.Rows, row => Equals(row["implementation_kind"], "Method") && row["parent_method_key"] is null);
+            Assert.Contains(query.Rows, row => Equals(row["implementation_kind"], "LocalFunction") && row["parent_method_key"] is not null && Equals(row["access_modifier"], "Local"));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_PersistsSymbolReferenceTypeMetadata()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("Symbols.cs", "HASH", includeSymbolMetadata: true)],
+                Array.Empty<string>(),
+                fullRebuild: true,
+                CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT symbol_name, symbol_kind, symbol_container_type_name, symbol_type_name FROM v1_symbol_refs WHERE symbol_name = 'Parameters'", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Single(query.Rows);
+            Assert.Equal("Property", Convert.ToString(query.Rows[0]["symbol_kind"], CultureInfo.InvariantCulture));
+            Assert.Equal("SqliteCommand", Convert.ToString(query.Rows[0]["symbol_container_type_name"], CultureInfo.InvariantCulture));
+            Assert.Equal("SqliteParameterCollection", Convert.ToString(query.Rows[0]["symbol_type_name"], CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteReadOnlyQueryAsync_ReturnsNullForNullValues()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var result = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT NULL AS maybe_null", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Single(result.Rows);
+            Assert.Null(result.Rows[0]["maybe_null"]);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteReadOnlyQueryAsync_UsesCaseInsensitiveRowLookup()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var result = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT 123 AS MixedCaseColumn", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Equal(123L, Convert.ToInt64(result.Rows[0]["mixedcasecolumn"], CultureInfo.InvariantCulture));
+            Assert.Equal(123L, Convert.ToInt64(result.Rows[0]["MIXEDCASECOLUMN"], CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteReadOnlyQueryAsync_WhenMaxRowsIsZero_StillReturnsSingleRowAndMarksTruncated()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var result = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "WITH RECURSIVE nums(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM nums WHERE v < 3) SELECT v FROM nums", MaxRows: 0),
+                CancellationToken.None);
+
+            Assert.Single(result.Rows);
+            Assert.True(result.Truncated);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task DescribeSchemaAsync_IncludesMetaScanStateTable()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var schema = await storage.DescribeSchemaAsync(databasePath, CancellationToken.None);
+
+            Assert.Contains(schema.Entities, entity => entity.Name == "meta_scan_state" && entity.Kind == "table");
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
     private static SqliteStorageEngine CreateStorage()
     {
         return new SqliteStorageEngine(new ReadOnlySqlSafetyValidator());
+    }
+
+    private static FileFacts CreateSimpleFacts(string relativePath, string hash, bool includeInheritance = false, bool includeSymbolMetadata = false)
+    {
+        var fullPath = Path.GetFullPath(relativePath);
+        const string typeKey = "Sample.Widget@1";
+        const string methodKey = "Sample.Widget@1:Method:Run@3:5";
+        const string variableKey = "Sample.Widget@1:Method:Run@3:5:Parameter:value@3";
+
+        var types = new[]
+        {
+            new TypeFact(typeKey, "Widget", "Class", "Public", "", "Sample.Widget", 1, 1)
+        };
+
+        var typeInheritances = includeInheritance
+            ? new[] { new TypeInheritanceFact(typeKey, "BaseWidget", "BaseType") }
+            : Array.Empty<TypeInheritanceFact>();
+
+        var methods = new[]
+        {
+            new MethodFact(methodKey, "Run", "int", "int value", 1, "Public", "", "Method", null, typeKey, 3, 6, 5, 9)
+        };
+
+        var lines = new[]
+        {
+            new LineFact(4, "return value;", methodKey, 0, 1)
+        };
+
+        var variables = new[]
+        {
+            new VariableFact(variableKey, methodKey, "value", "Parameter", "int", 3)
+        };
+
+        var lineVariables = new[]
+        {
+            new LineVariableFact(4, methodKey, "value", variableKey)
+        };
+
+        var invocations = new[]
+        {
+            new InvocationFact(methodKey, 4, "System.Console.WriteLine(value)", "WriteLine")
+        };
+
+        var symbolReferences = includeSymbolMetadata
+            ? new[]
+            {
+                new SymbolReferenceFact(4, methodKey, "value", "Variable", null, "Int32"),
+                new SymbolReferenceFact(4, methodKey, "Parameters", "Property", "SqliteCommand", "SqliteParameterCollection")
+            }
+            : new[]
+            {
+                new SymbolReferenceFact(4, methodKey, "value", "Variable", null, "Int32")
+            };
+
+        return new FileFacts(
+            fullPath,
+            hash,
+            "csharp",
+            types,
+            typeInheritances,
+            methods,
+            lines,
+            variables,
+            lineVariables,
+            invocations,
+            symbolReferences);
+    }
+
+    private static FileFacts CreateFactsWithNestedMethod(string relativePath, string hash)
+    {
+        var fullPath = Path.GetFullPath(relativePath);
+        const string typeKey = "Sample.NestedWidget@1";
+        const string rootMethod = "Sample.NestedWidget@1:Method:Run@3:5";
+        const string nestedMethod = "Sample.NestedWidget@1:Method:Run@3:5:LocalFunction:LocalAdjust@4:9";
+
+        return new FileFacts(
+            fullPath,
+            hash,
+            "csharp",
+            [new TypeFact(typeKey, "NestedWidget", "Class", "Public", "", "Sample.NestedWidget", 1, 1)],
+            Array.Empty<TypeInheritanceFact>(),
+            [
+                new MethodFact(rootMethod, "Run", "int", "", 0, "Public", "", "Method", null, typeKey, 3, 9, 5, 9),
+                new MethodFact(nestedMethod, "LocalAdjust", "int", "int value", 1, "Local", "", "LocalFunction", rootMethod, typeKey, 4, 7, 9, 9)
+            ],
+            [
+                new LineFact(4, "int LocalAdjust(int value)", rootMethod, 0, 0),
+                new LineFact(6, "return value;", nestedMethod, 1, 1)
+            ],
+            [new VariableFact("nested-value", nestedMethod, "value", "Parameter", "int", 4)],
+            [new LineVariableFact(6, nestedMethod, "value", "nested-value")],
+            Array.Empty<InvocationFact>(),
+            [new SymbolReferenceFact(6, nestedMethod, "value", "Variable", null, "Int32")]);
     }
 
     private static string CreateTempDatabasePath()

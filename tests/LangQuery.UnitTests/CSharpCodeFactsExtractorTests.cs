@@ -210,4 +210,305 @@ public sealed class CSharpCodeFactsExtractorTests
                 inheritance.BaseTypeName == "ITraceable" &&
                 inheritance.RelationKind == "Interface");
     }
+
+    [Fact]
+    public void Extract_ProducesConstructorFactsWithCtorReturnType()
+    {
+        var source = """
+            namespace Sample;
+
+            public sealed class Widget
+            {
+                public Widget(int capacity)
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Widget.cs", source, "HASH");
+
+        var constructor = Assert.Single(facts.Methods, method => method.ImplementationKind == "Constructor");
+        Assert.Equal("Widget", constructor.Name);
+        Assert.Equal("ctor", constructor.ReturnType);
+        Assert.Equal("Public", constructor.AccessModifier);
+        Assert.Equal(1, constructor.ParameterCount);
+        Assert.Equal("int capacity", constructor.Parameters);
+    }
+
+    [Fact]
+    public void Extract_InterfaceMethodDefaultsToPublicAccessModifier()
+    {
+        var source = """
+            namespace Sample;
+
+            public interface IRunner
+            {
+                void Run();
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("IRunner.cs", source, "HASH");
+
+        var method = Assert.Single(facts.Methods, item => item.Name == "Run");
+        Assert.Equal("Method", method.ImplementationKind);
+        Assert.Equal("Public", method.AccessModifier);
+    }
+
+    [Fact]
+    public void Extract_DefaultTypeAccessModifierIsInternalAndNestedTypeDefaultsToPrivate()
+    {
+        var source = """
+            namespace Sample;
+
+            class Outer
+            {
+                class Inner
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Outer.cs", source, "HASH");
+
+        var outer = Assert.Single(facts.Types, type => type.Name == "Outer");
+        var inner = Assert.Single(facts.Types, type => type.Name == "Inner");
+
+        Assert.Equal("Internal", outer.AccessModifier);
+        Assert.Equal("Private", inner.AccessModifier);
+    }
+
+    [Fact]
+    public void Extract_RecognizesFileScopedTypeRecordAndEnumKinds()
+    {
+        var source = """
+            namespace Sample;
+
+            file sealed class HiddenSignal
+            {
+            }
+
+            public readonly record struct Snapshot(int Value);
+
+            public enum ForecastState
+            {
+                Idle,
+                Busy
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Shapes.cs", source, "HASH");
+
+        Assert.Contains(facts.Types, type => type.Name == "HiddenSignal" && type.AccessModifier == "File");
+        Assert.Contains(facts.Types, type => type.Name == "Snapshot" && type.Kind == "Record" && type.Modifiers.Contains("ReadOnly", StringComparison.Ordinal));
+        Assert.Contains(facts.Types, type => type.Name == "ForecastState" && type.Kind == "Enum");
+    }
+
+    [Fact]
+    public void Extract_TracksForEachAndCatchVariableKinds()
+    {
+        var source = """
+            using System;
+            using System.Collections.Generic;
+
+            namespace Sample;
+
+            public sealed class Processor
+            {
+                public int Run(IEnumerable<int> values)
+                {
+                    var total = 0;
+                    foreach (var value in values)
+                    {
+                        total += value;
+                    }
+
+                    try
+                    {
+                        throw new InvalidOperationException();
+                    }
+                    catch (InvalidOperationException ex)
+                    {
+                        total += ex.Message.Length;
+                    }
+
+                    return total;
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Processor.cs", source, "HASH");
+
+        Assert.Contains(facts.Variables, variable => variable.Name == "value" && variable.Kind == "ForEach");
+        Assert.Contains(facts.Variables, variable => variable.Name == "ex" && variable.Kind == "Catch" && variable.TypeName == "InvalidOperationException");
+    }
+
+    [Fact]
+    public void Extract_UsesBaseInterfaceRelationForInterfaceInheritance()
+    {
+        var source = """
+            namespace Sample;
+
+            public interface IRoot
+            {
+            }
+
+            public interface IChild : IRoot
+            {
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Interfaces.cs", source, "HASH");
+
+        var child = Assert.Single(facts.Types, type => type.Name == "IChild");
+        Assert.Contains(facts.TypeInheritances, edge => edge.TypeKey == child.TypeKey && edge.BaseTypeName == "IRoot" && edge.RelationKind == "BaseInterface");
+    }
+
+    [Fact]
+    public void Extract_UsesInterfaceRelationForStructImplementedInterfaces()
+    {
+        var source = """
+            namespace Sample;
+
+            public interface ITag
+            {
+            }
+
+            public struct Tagged : ITag
+            {
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Tagged.cs", source, "HASH");
+
+        var tagged = Assert.Single(facts.Types, type => type.Name == "Tagged");
+        Assert.Contains(facts.TypeInheritances, edge => edge.TypeKey == tagged.TypeKey && edge.BaseTypeName == "ITag" && edge.RelationKind == "Interface");
+    }
+
+    [Fact]
+    public void Extract_ResolvesProtectedInternalAndPrivateProtectedAccessModifiers()
+    {
+        var source = """
+            namespace Sample;
+
+            public class AccessPlayground
+            {
+                protected internal void Lift()
+                {
+                }
+
+                private protected void Clamp()
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("AccessPlayground.cs", source, "HASH");
+
+        Assert.Contains(facts.Methods, method => method.Name == "Lift" && method.AccessModifier == "ProtectedInternal");
+        Assert.Contains(facts.Methods, method => method.Name == "Clamp" && method.AccessModifier == "PrivateProtected");
+    }
+
+    [Fact]
+    public void Extract_IncludesParameterModifiersInParameterSignature()
+    {
+        var source = """
+            namespace Sample;
+
+            public sealed class ModifierMethods
+            {
+                public void Run(ref int left, out int right, in int baseline, params string[] names)
+                {
+                    right = left + baseline + names.Length;
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("ModifierMethods.cs", source, "HASH");
+
+        var run = Assert.Single(facts.Methods, method => method.Name == "Run");
+        Assert.Contains("ref int left", run.Parameters, StringComparison.Ordinal);
+        Assert.Contains("out int right", run.Parameters, StringComparison.Ordinal);
+        Assert.Contains("in int baseline", run.Parameters, StringComparison.Ordinal);
+        Assert.Contains("params string[] names", run.Parameters, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Extract_ClassifiesFieldAndEventReferencesAsPropertySymbols()
+    {
+        var source = """
+            using System;
+
+            namespace Sample;
+
+            public sealed class SignalEmitter
+            {
+                private int _count;
+
+                public event EventHandler? Changed;
+
+                public void Tick()
+                {
+                    _count++;
+                    Changed?.Invoke(this, EventArgs.Empty);
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("SignalEmitter.cs", source, "HASH");
+
+        Assert.Contains(facts.SymbolReferences, reference => reference.SymbolName == "_count" && reference.SymbolKind == "Property" && reference.SymbolTypeName == "Int32");
+        Assert.Contains(facts.SymbolReferences, reference => reference.SymbolName == "Changed" && reference.SymbolKind == "Property" && reference.SymbolTypeName == "EventHandler");
+    }
+
+    [Fact]
+    public void Extract_BuildsNestedFullTypeName()
+    {
+        var source = """
+            namespace Sample;
+
+            public sealed class Outer
+            {
+                public sealed class Inner
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("NestedTypes.cs", source, "HASH");
+
+        var inner = Assert.Single(facts.Types, type => type.Name == "Inner");
+        Assert.Equal("Sample.Outer.Inner", inner.FullName);
+    }
+
+    [Fact]
+    public void Extract_PrivateConstructorDefaultsToPrivateAccess()
+    {
+        var source = """
+            namespace Sample;
+
+            public sealed class Token
+            {
+                Token()
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("Token.cs", source, "HASH");
+
+        var constructor = Assert.Single(facts.Methods, method => method.ImplementationKind == "Constructor");
+        Assert.Equal("Private", constructor.AccessModifier);
+    }
 }
