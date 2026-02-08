@@ -29,6 +29,24 @@ This plan expands test coverage for LangQuery with a focus on:
 - Sample fixture now uses a real `.sln` + `.csproj` layout.
 - Existing tests that previously depended on an empty solution were preserved by adding a temp empty-solution test path.
 
+## Post-Commit Bug Hardening (Top 15)
+
+- [x] 1. Untrusted project evaluation can execute arbitrary code.
+- [x] 2. `--db` can corrupt non-LangQuery SQLite databases.
+- [x] 3. Unknown options are silently ignored.
+- [x] 4. Missing option values degrade into flags and unsafe defaults.
+- [x] 5. SQL duplicate column names overwrite row values.
+- [x] 6. Project references can escape solution root.
+- [x] 7. `exportjson` loads everything in memory.
+- [x] 8. Migrations are not atomic.
+- [x] 9. Missing project file aborts whole solution scan.
+- [x] 10. Nested namespaces are flattened incorrectly.
+- [x] 11. Method default access inside class nested in interface is wrong.
+- [x] 12. Nested type default access inside interfaces is wrong.
+- [x] 13. Variable resolution ignores lexical scope boundaries.
+- [x] 14. Ignored directory filtering is case-sensitive.
+- [x] 15. `timeout-ms` is rounded to whole seconds.
+
 ## Fixture Enhancements
 
 1. Update `tests/sample_solution/SampleSolution.sln` to include a real project entry (`src/Sample.App/Sample.App.csproj`).

@@ -10,6 +10,8 @@ namespace LangQuery.Storage.Sqlite.Storage;
 public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : IStorageEngine
 {
     private const int CurrentSchemaVersion = 5;
+    private const string OwnershipCapabilityKey = "owner";
+    private const string OwnershipCapabilityValue = "langquery";
 
     public async Task InitializeAsync(string databasePath, CancellationToken cancellationToken)
     {
@@ -19,14 +21,26 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         await using var connection = CreateConnection(databasePath, readOnly: false);
         await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
         await EnableForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
+        await EnsureDatabaseOwnershipAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
 
         var version = await GetSchemaVersionInternalAsync(connection, cancellationToken).ConfigureAwait(false);
         if (version < CurrentSchemaVersion)
         {
-            await ApplyMigrationsAsync(connection, cancellationToken).ConfigureAwait(false);
-            await SetSchemaVersionAsync(connection, CurrentSchemaVersion, cancellationToken).ConfigureAwait(false);
-            await SeedCapabilitiesAsync(connection, cancellationToken).ConfigureAwait(false);
+            await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
+            try
+            {
+                await ApplyMigrationsAsync(connection, tx, cancellationToken).ConfigureAwait(false);
+                await SetSchemaVersionAsync(connection, tx, CurrentSchemaVersion, cancellationToken).ConfigureAwait(false);
+                await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+            }
+            catch
+            {
+                await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
+                throw;
+            }
         }
+
+        await SeedCapabilitiesAsync(connection, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyDictionary<string, string>> GetIndexedFileHashesAsync(string databasePath, CancellationToken cancellationToken)
@@ -110,34 +124,48 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
 
         await using var command = connection.CreateCommand();
         command.CommandText = options.Sql;
-        command.CommandTimeout = Math.Max(1, options.TimeoutMs / 1000);
+        command.CommandTimeout = 0;
 
         var columns = new List<string>();
+        var rowColumnNames = new List<string>();
         var rows = new List<IReadOnlyDictionary<string, object?>>();
         var truncated = false;
         var maxRows = Math.Max(1, options.MaxRows);
 
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        for (var i = 0; i < reader.FieldCount; i++)
-        {
-            columns.Add(reader.GetName(i));
-        }
+        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(1, options.TimeoutMs)));
+        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
+        var executionToken = linkedCts.Token;
 
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        try
         {
-            if (rows.Count >= maxRows)
-            {
-                truncated = true;
-                break;
-            }
-
-            var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+            await using var reader = await command.ExecuteReaderAsync(executionToken).ConfigureAwait(false);
             for (var i = 0; i < reader.FieldCount; i++)
             {
-                row[columns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                columns.Add(reader.GetName(i));
             }
 
-            rows.Add(row);
+            rowColumnNames.AddRange(BuildUniqueColumnNames(columns));
+
+            while (await reader.ReadAsync(executionToken).ConfigureAwait(false))
+            {
+                if (rows.Count >= maxRows)
+                {
+                    truncated = true;
+                    break;
+                }
+
+                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                for (var i = 0; i < reader.FieldCount; i++)
+                {
+                    row[rowColumnNames[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                }
+
+                rows.Add(row);
+            }
+        }
+        catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
+        {
+            throw new TimeoutException($"SQL query timed out after {Math.Max(1, options.TimeoutMs)} ms.", ex);
         }
 
         stopwatch.Stop();
@@ -425,7 +453,7 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         await command.ExecuteNonQueryAsync(cancellationToken).ConfigureAwait(false);
     }
 
-    private static async Task ApplyMigrationsAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task ApplyMigrationsAsync(SqliteConnection connection, SqliteTransaction tx, CancellationToken cancellationToken)
     {
         var setupStatements = new[]
         {
@@ -449,19 +477,19 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
 
         foreach (var sql in setupStatements)
         {
-            await ExecuteAsync(connection, null, sql, cancellationToken).ConfigureAwait(false);
+            await ExecuteAsync(connection, tx, sql, cancellationToken).ConfigureAwait(false);
         }
 
-        await EnsureColumnExistsAsync(connection, "types", "access_modifier", "TEXT NOT NULL DEFAULT 'Internal'", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "types", "modifiers", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "access_modifier", "TEXT NOT NULL DEFAULT 'Private'", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "modifiers", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "parameters", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "parameter_count", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "implementation_kind", "TEXT NOT NULL DEFAULT 'Method'", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "methods", "parent_method_key", "TEXT NULL", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "symbol_refs", "symbol_container_type_name", "TEXT NULL", cancellationToken).ConfigureAwait(false);
-        await EnsureColumnExistsAsync(connection, "symbol_refs", "symbol_type_name", "TEXT NULL", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "types", "access_modifier", "TEXT NOT NULL DEFAULT 'Internal'", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "types", "modifiers", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "access_modifier", "TEXT NOT NULL DEFAULT 'Private'", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "modifiers", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "parameters", "TEXT NOT NULL DEFAULT ''", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "parameter_count", "INTEGER NOT NULL DEFAULT 0", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "implementation_kind", "TEXT NOT NULL DEFAULT 'Method'", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "methods", "parent_method_key", "TEXT NULL", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "symbol_refs", "symbol_container_type_name", "TEXT NULL", cancellationToken).ConfigureAwait(false);
+        await EnsureColumnExistsAsync(connection, tx, "symbol_refs", "symbol_type_name", "TEXT NULL", cancellationToken).ConfigureAwait(false);
 
         var viewStatements = new[]
         {
@@ -487,18 +515,20 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
 
         foreach (var sql in viewStatements)
         {
-            await ExecuteAsync(connection, null, sql, cancellationToken).ConfigureAwait(false);
+            await ExecuteAsync(connection, tx, sql, cancellationToken).ConfigureAwait(false);
         }
     }
 
     private static async Task EnsureColumnExistsAsync(
         SqliteConnection connection,
+        SqliteTransaction tx,
         string tableName,
         string columnName,
         string columnDefinition,
         CancellationToken cancellationToken)
     {
         await using var command = connection.CreateCommand();
+        command.Transaction = tx;
         command.CommandText = $"PRAGMA table_info('{tableName.Replace("'", "''", StringComparison.Ordinal)}');";
 
         var exists = false;
@@ -520,14 +550,117 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
 
         await ExecuteAsync(
             connection,
-            null,
+            tx,
             $"ALTER TABLE {tableName} ADD COLUMN {columnName} {columnDefinition};",
             cancellationToken).ConfigureAwait(false);
     }
-    private static async Task SetSchemaVersionAsync(SqliteConnection connection, int version, CancellationToken cancellationToken)
+
+    private static IReadOnlyList<string> BuildUniqueColumnNames(IReadOnlyList<string> columns)
     {
-        await ExecuteAsync(connection, null, "DELETE FROM meta_schema_version;", cancellationToken).ConfigureAwait(false);
-        await ExecuteAsync(connection, null, "INSERT INTO meta_schema_version(version, applied_utc) VALUES ($version, $appliedUtc);", cancellationToken, ("$version", version), ("$appliedUtc", DateTimeOffset.UtcNow.ToString("O"))).ConfigureAwait(false);
+        var uniqueNames = new List<string>(columns.Count);
+        var usedNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var seenByBaseName = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+
+        for (var i = 0; i < columns.Count; i++)
+        {
+            var baseName = string.IsNullOrWhiteSpace(columns[i]) ? $"column_{i + 1}" : columns[i];
+            if (!seenByBaseName.TryGetValue(baseName, out var seenCount))
+            {
+                seenByBaseName[baseName] = 1;
+                uniqueNames.Add(baseName);
+                usedNames.Add(baseName);
+                continue;
+            }
+
+            var suffix = seenCount + 1;
+            var candidate = $"{baseName}_{suffix}";
+            while (!usedNames.Add(candidate))
+            {
+                suffix++;
+                candidate = $"{baseName}_{suffix}";
+            }
+
+            seenByBaseName[baseName] = suffix;
+            uniqueNames.Add(candidate);
+        }
+
+        return uniqueNames;
+    }
+
+    private static async Task SetSchemaVersionAsync(SqliteConnection connection, SqliteTransaction tx, int version, CancellationToken cancellationToken)
+    {
+        await ExecuteAsync(connection, tx, "DELETE FROM meta_schema_version;", cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, tx, "INSERT INTO meta_schema_version(version, applied_utc) VALUES ($version, $appliedUtc);", cancellationToken, ("$version", version), ("$appliedUtc", DateTimeOffset.UtcNow.ToString("O"))).ConfigureAwait(false);
+    }
+
+    private static async Task EnsureDatabaseOwnershipAsync(SqliteConnection connection, string databasePath, CancellationToken cancellationToken)
+    {
+        if (await IsDatabaseEmptyAsync(connection, cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        if (await HasOwnershipMarkerAsync(connection, cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        if (await HasLegacyLangQuerySignatureAsync(connection, cancellationToken).ConfigureAwait(false))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Database '{Path.GetFullPath(databasePath)}' is not a LangQuery database. Refusing to modify an existing non-LangQuery SQLite file. Choose a new '--db' path for LangQuery.");
+    }
+
+    private static async Task<bool> IsDatabaseEmptyAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' AND type IN ('table', 'view', 'index', 'trigger');";
+        var count = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
+        return count == 0;
+    }
+
+    private static async Task<bool> HasOwnershipMarkerAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        if (!await TableExistsAsync(connection, "meta_capabilities", cancellationToken).ConfigureAwait(false))
+        {
+            return false;
+        }
+
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT value FROM meta_capabilities WHERE key = $key LIMIT 1;";
+        command.Parameters.AddWithValue("$key", OwnershipCapabilityKey);
+        var value = await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false);
+        if (value is null || value is DBNull)
+        {
+            return false;
+        }
+
+        return string.Equals(Convert.ToString(value, CultureInfo.InvariantCulture), OwnershipCapabilityValue, StringComparison.OrdinalIgnoreCase);
+    }
+
+    private static async Task<bool> HasLegacyLangQuerySignatureAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    {
+        var requiredTables = new[] { "meta_schema_version", "meta_capabilities", "meta_scan_state", "files", "types", "methods", "lines", "variables", "line_variables", "invocations", "symbol_refs" };
+        foreach (var table in requiredTables)
+        {
+            if (!await TableExistsAsync(connection, table, cancellationToken).ConfigureAwait(false))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private static async Task<bool> TableExistsAsync(SqliteConnection connection, string tableName, CancellationToken cancellationToken)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = $name;";
+        command.Parameters.AddWithValue("$name", tableName);
+        var count = Convert.ToInt32(await command.ExecuteScalarAsync(cancellationToken).ConfigureAwait(false), CultureInfo.InvariantCulture);
+        return count == 1;
     }
 
     private static async Task<int> GetSchemaVersionInternalAsync(SqliteConnection connection, CancellationToken cancellationToken)
@@ -582,5 +715,6 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         await ExecuteAsync(connection, null, "INSERT OR REPLACE INTO meta_capabilities(key, value) VALUES ('sql_mode', 'read-only');", cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, null, "INSERT OR REPLACE INTO meta_capabilities(key, value) VALUES ('public_views', 'v1');", cancellationToken).ConfigureAwait(false);
         await ExecuteAsync(connection, null, "INSERT OR REPLACE INTO meta_capabilities(key, value) VALUES ('languages', 'csharp');", cancellationToken).ConfigureAwait(false);
+        await ExecuteAsync(connection, null, $"INSERT OR REPLACE INTO meta_capabilities(key, value) VALUES ('{OwnershipCapabilityKey}', '{OwnershipCapabilityValue}');", cancellationToken).ConfigureAwait(false);
     }
 }

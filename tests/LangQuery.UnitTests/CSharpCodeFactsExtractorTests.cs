@@ -511,4 +511,100 @@ public sealed class CSharpCodeFactsExtractorTests
         var constructor = Assert.Single(facts.Methods, method => method.ImplementationKind == "Constructor");
         Assert.Equal("Private", constructor.AccessModifier);
     }
+
+    [Fact]
+    public void Extract_CapturesFullyQualifiedNestedNamespaceForTypeNames()
+    {
+        var source = """
+            namespace A.B
+            {
+                namespace C
+                {
+                    public sealed class DeepType
+                    {
+                    }
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("DeepType.cs", source, "HASH");
+
+        var deepType = Assert.Single(facts.Types, type => type.Name == "DeepType");
+        Assert.Equal("A.B.C.DeepType", deepType.FullName);
+        Assert.StartsWith("A.B.C.DeepType@", deepType.TypeKey, StringComparison.Ordinal);
+    }
+
+    [Fact]
+    public void Extract_DefaultMethodAccessInClassNestedInInterfaceIsPrivate()
+    {
+        var source = """
+            namespace Sample;
+
+            public interface IHost
+            {
+                class Worker
+                {
+                    void Run()
+                    {
+                    }
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("IHost.cs", source, "HASH");
+
+        var run = Assert.Single(facts.Methods, method => method.Name == "Run");
+        Assert.Equal("Private", run.AccessModifier);
+    }
+
+    [Fact]
+    public void Extract_DefaultNestedTypeAccessInsideInterfaceIsPublic()
+    {
+        var source = """
+            namespace Sample;
+
+            public interface IHost
+            {
+                class Worker
+                {
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("IHost.cs", source, "HASH");
+
+        var worker = Assert.Single(facts.Types, type => type.Name == "Worker");
+        Assert.Equal("Public", worker.AccessModifier);
+    }
+
+    [Fact]
+    public void Extract_DoesNotLinkOutOfScopeIdentifierToLocalVariable()
+    {
+        var source = """
+            namespace Sample;
+
+            public sealed class ScopePlayground
+            {
+                public void Run()
+                {
+                    if (true)
+                    {
+                        var scoped = 1;
+                    }
+
+                    System.Console.WriteLine(scoped);
+                }
+            }
+            """;
+
+        var extractor = new CSharpCodeFactsExtractor();
+        var facts = extractor.Extract("ScopePlayground.cs", source, "HASH");
+
+        Assert.Single(facts.Variables, variable => variable.Name == "scoped" && variable.Kind == "Local");
+        Assert.DoesNotContain(facts.LineVariables, usage => usage.VariableName == "scoped");
+        Assert.Contains(facts.SymbolReferences, reference => reference.SymbolName == "scoped" && reference.SymbolKind == "Identifier");
+    }
 }

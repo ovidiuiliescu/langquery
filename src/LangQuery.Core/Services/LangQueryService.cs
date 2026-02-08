@@ -1,7 +1,8 @@
 using System.Diagnostics;
 using System.Security.Cryptography;
-using System.Text.Json;
 using System.Text.RegularExpressions;
+using System.Xml;
+using System.Xml.Linq;
 using LangQuery.Core.Abstractions;
 using LangQuery.Core.Models;
 
@@ -13,15 +14,15 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
         """^Project\("\{[^\"]+\}"\)\s*=\s*"[^"]+",\s*"(?<path>[^"]+)",\s*"\{[^\"]+\}"$""",
         RegexOptions.Compiled);
 
-    private static readonly HashSet<string> IgnoredDirectories =
-    [
+    private static readonly HashSet<string> IgnoredDirectories = new(StringComparer.OrdinalIgnoreCase)
+    {
         ".git",
         "bin",
         "obj",
         ".vs",
         ".idea",
         ".vscode"
-    ];
+    };
 
     public async Task<ScanSummary> ScanAsync(ScanOptions options, CancellationToken cancellationToken = default)
     {
@@ -143,7 +144,7 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
         return DiscoverDirectorySourceFiles(fullPath).ToArray();
     }
 
-    private static async Task<string[]> DiscoverSolutionSourceFilesAsync(string solutionPath, CancellationToken cancellationToken)
+    private static Task<string[]> DiscoverSolutionSourceFilesAsync(string solutionPath, CancellationToken cancellationToken)
     {
         var solutionDirectory = Path.GetDirectoryName(solutionPath)
                                 ?? throw new DirectoryNotFoundException($"Could not derive root folder from '{solutionPath}'.");
@@ -164,10 +165,10 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
 
             if (!File.Exists(projectPath))
             {
-                throw new FileNotFoundException($"Project '{projectPath}' referenced by solution '{solutionPath}' does not exist.", projectPath);
+                continue;
             }
 
-            var projectItems = await EvaluateProjectItemsAsync(projectPath, cancellationToken).ConfigureAwait(false);
+            var projectItems = EvaluateProjectItems(projectPath, solutionDirectory);
 
             foreach (var compilePath in projectItems.CompileFiles)
             {
@@ -186,7 +187,7 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
             }
         }
 
-        return files.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+        return Task.FromResult(files.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
     private static IEnumerable<string> DiscoverDirectorySourceFiles(string rootPath)
@@ -212,129 +213,198 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
             }
 
             var normalizedRelativePath = NormalizePathSeparators(relativeProjectPath);
-            yield return Path.GetFullPath(Path.Combine(solutionDirectory, normalizedRelativePath));
+            var fullProjectPath = Path.GetFullPath(Path.Combine(solutionDirectory, normalizedRelativePath));
+            EnsurePathWithinSolutionRoot(fullProjectPath, solutionDirectory, $"Project '{relativeProjectPath}' from solution '{solutionPath}'");
+            yield return fullProjectPath;
         }
     }
 
-    private static async Task<ProjectItems> EvaluateProjectItemsAsync(string projectPath, CancellationToken cancellationToken)
+    private static ProjectItems EvaluateProjectItems(string projectPath, string solutionDirectory)
     {
-        var startInfo = new ProcessStartInfo("dotnet")
-        {
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        startInfo.ArgumentList.Add("msbuild");
-        startInfo.ArgumentList.Add(projectPath);
-        startInfo.ArgumentList.Add("-nologo");
-        startInfo.ArgumentList.Add("-verbosity:quiet");
-        startInfo.ArgumentList.Add("-getItem:Compile");
-        startInfo.ArgumentList.Add("-getItem:ProjectReference");
-
-        using var process = new Process { StartInfo = startInfo };
-        process.Start();
-
-        var stdoutTask = process.StandardOutput.ReadToEndAsync();
-        var stderrTask = process.StandardError.ReadToEndAsync();
-
-        try
-        {
-            await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-        }
-        catch
-        {
-            TryKill(process);
-            throw;
-        }
-
-        var stdout = await stdoutTask.ConfigureAwait(false);
-        var stderr = await stderrTask.ConfigureAwait(false);
-
-        if (process.ExitCode != 0)
-        {
-            var errorText = string.IsNullOrWhiteSpace(stderr) ? stdout : stderr;
-            throw new InvalidOperationException($"Failed to evaluate project '{projectPath}'. {errorText.Trim()}");
-        }
-
-        try
-        {
-            using var document = JsonDocument.Parse(stdout);
-            if (!document.RootElement.TryGetProperty("Items", out var itemsElement) ||
-                itemsElement.ValueKind != JsonValueKind.Object)
-            {
-                return new ProjectItems(Array.Empty<string>(), Array.Empty<string>());
-            }
-
-            var compileFiles = ExtractItemPaths(itemsElement, "Compile", projectPath, ".cs");
-            var projectReferences = ExtractItemPaths(itemsElement, "ProjectReference", projectPath, ".csproj");
-            return new ProjectItems(compileFiles, projectReferences);
-        }
-        catch (JsonException ex)
-        {
-            throw new InvalidOperationException($"Unexpected MSBuild output while evaluating '{projectPath}'.", ex);
-        }
-    }
-
-    private static string[] ExtractItemPaths(JsonElement itemsElement, string itemName, string projectPath, string extension)
-    {
-        if (!itemsElement.TryGetProperty(itemName, out var entries) || entries.ValueKind != JsonValueKind.Array)
-        {
-            return [];
-        }
-
         var projectDirectory = Path.GetDirectoryName(projectPath)
                                ?? throw new DirectoryNotFoundException($"Could not derive project folder from '{projectPath}'.");
 
-        var result = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-        foreach (var entry in entries.EnumerateArray())
+        var compileFiles = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var projectReferences = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        var useDefaultCompileItems = true;
+        var document = LoadProjectDocument(projectPath);
+        foreach (var property in document.Descendants().Where(static x => string.Equals(x.Name.LocalName, "EnableDefaultCompileItems", StringComparison.Ordinal)))
         {
-            if (entry.ValueKind != JsonValueKind.Object)
+            if (bool.TryParse(property.Value, out var parsedValue))
             {
-                continue;
+                useDefaultCompileItems = parsedValue;
             }
-
-            var itemPath = ResolveItemPath(entry, projectDirectory);
-            if (string.IsNullOrWhiteSpace(itemPath) ||
-                !string.Equals(Path.GetExtension(itemPath), extension, StringComparison.OrdinalIgnoreCase))
-            {
-                continue;
-            }
-
-            result.Add(itemPath);
         }
 
-        return result.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray();
+        if (useDefaultCompileItems)
+        {
+            foreach (var filePath in Directory.EnumerateFiles(projectDirectory, "*.cs", SearchOption.AllDirectories))
+            {
+                if (!IsUnderIgnoredDirectory(filePath))
+                {
+                    compileFiles.Add(Path.GetFullPath(filePath));
+                }
+            }
+        }
+
+        var explicitCompileIncludes = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        var explicitCompileRemoves = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var item in document.Descendants().Where(static x => string.Equals(x.Name.LocalName, "Compile", StringComparison.Ordinal)))
+        {
+            AddMatchesFromAttribute(item, "Include", projectDirectory, ".cs", explicitCompileIncludes);
+            AddMatchesFromAttribute(item, "Remove", projectDirectory, ".cs", explicitCompileRemoves);
+        }
+
+        compileFiles.UnionWith(explicitCompileIncludes);
+        compileFiles.ExceptWith(explicitCompileRemoves);
+
+        foreach (var item in document.Descendants().Where(static x => string.Equals(x.Name.LocalName, "ProjectReference", StringComparison.Ordinal)))
+        {
+            AddProjectReferenceFromAttribute(item, projectDirectory, solutionDirectory, projectReferences, projectPath);
+        }
+
+        return new ProjectItems(
+            compileFiles.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray(),
+            projectReferences.OrderBy(path => path, StringComparer.OrdinalIgnoreCase).ToArray());
     }
 
-    private static string? ResolveItemPath(JsonElement itemElement, string projectDirectory)
+    private static XDocument LoadProjectDocument(string projectPath)
     {
-        if (!itemElement.TryGetProperty("FullPath", out var fullPathElement) ||
-            fullPathElement.ValueKind != JsonValueKind.String)
+        var settings = new XmlReaderSettings
         {
-            if (!itemElement.TryGetProperty("Identity", out var identityElement) ||
-                identityElement.ValueKind != JsonValueKind.String)
-            {
-                return null;
-            }
+            DtdProcessing = DtdProcessing.Prohibit,
+            XmlResolver = null
+        };
 
-            var identityValue = identityElement.GetString();
-            if (string.IsNullOrWhiteSpace(identityValue))
-            {
-                return null;
-            }
+        using var stream = File.OpenRead(projectPath);
+        using var reader = XmlReader.Create(stream, settings, projectPath);
+        return XDocument.Load(reader, LoadOptions.None);
+    }
 
-            return Path.GetFullPath(Path.Combine(projectDirectory, NormalizePathSeparators(identityValue)));
+    private static void AddMatchesFromAttribute(
+        XElement itemElement,
+        string attributeName,
+        string projectDirectory,
+        string extension,
+        ISet<string> result)
+    {
+        var attribute = itemElement.Attributes().FirstOrDefault(x => string.Equals(x.Name.LocalName, attributeName, StringComparison.Ordinal));
+        if (attribute is null || string.IsNullOrWhiteSpace(attribute.Value))
+        {
+            return;
         }
 
-        var fullPathValue = fullPathElement.GetString();
-        if (string.IsNullOrWhiteSpace(fullPathValue))
+        foreach (var rawPattern in attribute.Value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
         {
-            return null;
+            foreach (var filePath in ExpandProjectPattern(rawPattern, projectDirectory, extension))
+            {
+                if (!IsUnderIgnoredDirectory(filePath))
+                {
+                    result.Add(filePath);
+                }
+            }
+        }
+    }
+
+    private static IReadOnlyList<string> ExpandProjectPattern(string pattern, string projectDirectory, string extension)
+    {
+        var normalizedPattern = NormalizePathSeparators(pattern);
+        if (!normalizedPattern.Contains('*') && !normalizedPattern.Contains('?'))
+        {
+            var fullPath = Path.GetFullPath(Path.Combine(projectDirectory, normalizedPattern));
+            if (string.Equals(Path.GetExtension(fullPath), extension, StringComparison.OrdinalIgnoreCase))
+            {
+                return [fullPath];
+            }
+
+            return Array.Empty<string>();
         }
 
-        return Path.GetFullPath(fullPathValue);
+        if (normalizedPattern.StartsWith("**", StringComparison.Ordinal))
+        {
+            var suffix = normalizedPattern.TrimStart('*', Path.DirectorySeparatorChar);
+            var filePattern = Path.GetFileName(suffix);
+            if (string.IsNullOrWhiteSpace(filePattern))
+            {
+                filePattern = "*.cs";
+            }
+
+            return Directory
+                .EnumerateFiles(projectDirectory, filePattern, SearchOption.AllDirectories)
+                .Select(Path.GetFullPath)
+                .Where(path => string.Equals(Path.GetExtension(path), extension, StringComparison.OrdinalIgnoreCase))
+                .ToArray();
+        }
+
+        var searchDirectoryPattern = Path.GetDirectoryName(normalizedPattern);
+        var searchDirectory = string.IsNullOrWhiteSpace(searchDirectoryPattern)
+            ? projectDirectory
+            : Path.GetFullPath(Path.Combine(projectDirectory, searchDirectoryPattern));
+        var filePatternInDirectory = Path.GetFileName(normalizedPattern);
+
+        if (string.IsNullOrWhiteSpace(filePatternInDirectory) || !Directory.Exists(searchDirectory))
+        {
+            return Array.Empty<string>();
+        }
+
+        return Directory
+            .EnumerateFiles(searchDirectory, filePatternInDirectory, SearchOption.TopDirectoryOnly)
+            .Select(Path.GetFullPath)
+            .Where(path => string.Equals(Path.GetExtension(path), extension, StringComparison.OrdinalIgnoreCase))
+            .ToArray();
+    }
+
+    private static void AddProjectReferenceFromAttribute(
+        XElement itemElement,
+        string projectDirectory,
+        string solutionDirectory,
+        ISet<string> projectReferences,
+        string sourceProjectPath)
+    {
+        var includeAttribute = itemElement.Attributes().FirstOrDefault(static x => string.Equals(x.Name.LocalName, "Include", StringComparison.Ordinal));
+        if (includeAttribute is null || string.IsNullOrWhiteSpace(includeAttribute.Value))
+        {
+            return;
+        }
+
+        foreach (var rawPath in includeAttribute.Value.Split(';', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries))
+        {
+            var normalizedRelativePath = NormalizePathSeparators(rawPath);
+            var fullProjectPath = Path.GetFullPath(Path.Combine(projectDirectory, normalizedRelativePath));
+            if (!string.Equals(Path.GetExtension(fullProjectPath), ".csproj", StringComparison.OrdinalIgnoreCase))
+            {
+                continue;
+            }
+
+            EnsurePathWithinSolutionRoot(fullProjectPath, solutionDirectory, $"Project reference '{rawPath}' in '{sourceProjectPath}'");
+            projectReferences.Add(fullProjectPath);
+        }
+    }
+
+    private static void EnsurePathWithinSolutionRoot(string path, string solutionDirectory, string context)
+    {
+        if (IsPathWithinDirectory(path, solutionDirectory))
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"{context} resolves outside the solution root '{solutionDirectory}'.");
+    }
+
+    private static bool IsPathWithinDirectory(string path, string rootDirectory)
+    {
+        var fullPath = Path.GetFullPath(path);
+        var fullRoot = Path.GetFullPath(rootDirectory);
+
+        if (string.Equals(fullPath, fullRoot, StringComparison.OrdinalIgnoreCase))
+        {
+            return true;
+        }
+
+        var normalizedRoot = Path.TrimEndingDirectorySeparator(fullRoot) + Path.DirectorySeparatorChar;
+        return fullPath.StartsWith(normalizedRoot, StringComparison.OrdinalIgnoreCase);
     }
 
     private static string NormalizePathSeparators(string path)
@@ -342,19 +412,9 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
         return path.Replace('\\', Path.DirectorySeparatorChar).Replace('/', Path.DirectorySeparatorChar);
     }
 
-    private static void TryKill(Process process)
-    {
-        if (process.HasExited)
-        {
-            return;
-        }
-
-        process.Kill(entireProcessTree: true);
-    }
-
     private static bool IsUnderIgnoredDirectory(string path)
     {
-        var segments = path.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        var segments = path.Split([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], StringSplitOptions.RemoveEmptyEntries);
         return segments.Any(segment => IgnoredDirectories.Contains(segment));
     }
 

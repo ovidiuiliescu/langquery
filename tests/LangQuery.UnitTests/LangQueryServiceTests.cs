@@ -244,6 +244,34 @@ public sealed class LangQueryServiceTests
     }
 
     [Fact]
+    public async Task ScanAsync_DirectoryScanIgnoresMixedCaseIgnoredDirectories()
+    {
+        var workspace = CreateWorkspace(
+            [
+                ("A.cs", "namespace Demo; class A {}"),
+                (Path.Combine("Bin", "Ignored.cs"), "namespace Demo; class IgnoredBin {}"),
+                (Path.Combine("OBJ", "Ignored.cs"), "namespace Demo; class IgnoredObj {}"),
+                (Path.Combine(".VS", "Ignored.cs"), "namespace Demo; class IgnoredVs {}")
+            ]);
+
+        var databasePath = Path.Combine(workspace, "facts.db");
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+
+            var summary = await service.ScanAsync(new ScanOptions(workspace, databasePath), CancellationToken.None);
+
+            Assert.Equal(1, summary.FilesDiscovered);
+            Assert.Equal(1, summary.FilesScanned);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanAsync_WhenScanRootIsAFile_UsesContainingFolder()
     {
         var workspace = CreateWorkspace(
@@ -260,6 +288,166 @@ public sealed class LangQueryServiceTests
 
             Assert.Equal(2, summary.FilesDiscovered);
             Assert.Equal(2, summary.FilesScanned);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanIgnoresMixedCaseIgnoredDirectories()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "App", "A.cs"), "namespace Demo; class A {}"),
+                (Path.Combine("src", "App", "Bin", "Ignored.cs"), "namespace Demo; class IgnoredBin {}"),
+                (Path.Combine("src", "App", "OBJ", "Ignored.cs"), "namespace Demo; class IgnoredObj {}"),
+                (Path.Combine("src", "App", ".VS", "Ignored.cs"), "namespace Demo; class IgnoredVs {}"),
+                (Path.Combine("src", "App", "App.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+            ]);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["src\\App\\App.csproj"]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+
+            var summary = await service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None);
+
+            Assert.Equal(1, summary.FilesDiscovered);
+            Assert.Equal(1, summary.FilesScanned);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanSkipsMissingProjects()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "App", "A.cs"), "namespace Demo; class A {}"),
+                (Path.Combine("src", "App", "App.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>")
+            ]);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["src\\App\\App.csproj", "src\\Missing\\Missing.csproj"]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+
+            var summary = await service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None);
+
+            Assert.Equal(1, summary.FilesDiscovered);
+            Assert.Equal(1, summary.FilesScanned);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanRejectsProjectReferencesOutsideSolutionRoot()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "App", "A.cs"), "namespace Demo; class A {}")
+            ]);
+
+        var outsideRoot = Path.Combine(Path.GetTempPath(), "langquery-service-tests-outside", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(outsideRoot, "Escape"));
+        File.WriteAllText(Path.Combine(outsideRoot, "Escape", "Escape.cs"), "namespace Demo; class Escape {}");
+        File.WriteAllText(Path.Combine(outsideRoot, "Escape", "Escape.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>");
+
+        var appProjectPath = Path.Combine(workspace, "src", "App", "App.csproj");
+        var relativeEscapeProjectPath = Path.GetRelativePath(Path.GetDirectoryName(appProjectPath)!, Path.Combine(outsideRoot, "Escape", "Escape.csproj"));
+        var appProjectText = $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><ProjectReference Include=\"{relativeEscapeProjectPath.Replace('\\', '/')}\" /></ItemGroup></Project>";
+        File.WriteAllText(appProjectPath, appProjectText);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["src\\App\\App.csproj"]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None));
+
+            Assert.Contains("outside the solution root", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+            Directory.Delete(outsideRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanRejectsSolutionProjectsOutsideSolutionRoot()
+    {
+        var workspace = CreateWorkspace([]);
+
+        var outsideRoot = Path.Combine(Path.GetTempPath(), "langquery-service-tests-outside", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(outsideRoot, "Escape"));
+        File.WriteAllText(Path.Combine(outsideRoot, "Escape", "Escape.cs"), "namespace Demo; class Escape {}");
+        File.WriteAllText(Path.Combine(outsideRoot, "Escape", "Escape.csproj"), "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup></Project>");
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        var relativeEscapeProjectPath = Path.GetRelativePath(workspace, Path.Combine(outsideRoot, "Escape", "Escape.csproj")).Replace('/', '\\');
+        WriteSolutionFile(solutionPath, [relativeEscapeProjectPath]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None));
+
+            Assert.Contains("outside the solution root", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+            Directory.Delete(outsideRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanUsesStaticParsingWithoutExecutingProjectTargets()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "App", "A.cs"), "namespace Demo; class A {}")
+            ]);
+
+        var markerPath = Path.Combine(workspace, "project-target-marker.txt");
+        var appProjectPath = Path.Combine(workspace, "src", "App", "App.csproj");
+        var escapedMarkerPath = markerPath.Replace("\\", "\\\\");
+        var projectText = $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><Target Name=\"Probe\" BeforeTargets=\"Build\"><Exec Command=\"dotnet --version &gt; &quot;{escapedMarkerPath}&quot;\" /></Target></Project>";
+        File.WriteAllText(appProjectPath, projectText);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["src\\App\\App.csproj"]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+
+            var summary = await service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None);
+
+            Assert.Equal(1, summary.FilesDiscovered);
+            Assert.Equal(1, summary.FilesScanned);
+            Assert.False(File.Exists(markerPath));
         }
         finally
         {
@@ -327,6 +515,29 @@ public sealed class LangQueryServiceTests
         }
 
         return root;
+    }
+
+    private static void WriteSolutionFile(string solutionPath, IReadOnlyList<string> relativeProjectPaths)
+    {
+        var lines = new List<string>
+        {
+            "Microsoft Visual Studio Solution File, Format Version 12.00",
+            "# Visual Studio Version 17"
+        };
+
+        for (var index = 0; index < relativeProjectPaths.Count; index++)
+        {
+            var projectPath = relativeProjectPaths[index];
+            var projectName = Path.GetFileNameWithoutExtension(projectPath);
+            var projectGuid = Guid.NewGuid().ToString("D").ToUpperInvariant();
+            lines.Add($"Project(\"{{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}}\") = \"{projectName}\", \"{projectPath}\", \"{{{projectGuid}}}\"");
+            lines.Add("EndProject");
+        }
+
+        lines.Add("Global");
+        lines.Add("EndGlobal");
+
+        File.WriteAllLines(solutionPath, lines);
     }
 
     private static string ComputeSha256(string path)

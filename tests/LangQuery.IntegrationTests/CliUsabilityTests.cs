@@ -1,5 +1,6 @@
 using System.Diagnostics;
 using System.Text.Json;
+using Microsoft.Data.Sqlite;
 using Xunit;
 
 namespace LangQuery.IntegrationTests;
@@ -466,6 +467,70 @@ public sealed class CliUsabilityTests
     }
 
     [Fact]
+    public async Task ExportJsonCommand_WithLargerDatabase_ProducesCompleteRows()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-export-large", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+
+        var projectPath = Path.Combine(tempDirectory, "src", "Large", "Large.csproj");
+        var solutionPath = Path.Combine(tempDirectory, "Large.sln");
+        var databasePath = Path.Combine(tempDirectory, "large.db.sqlite");
+        var exportPath = Path.Combine(tempDirectory, "large-export.json");
+
+        WriteProject(projectPath, "Anchor");
+        var projectDirectory = Path.GetDirectoryName(projectPath)
+                               ?? throw new DirectoryNotFoundException($"Could not derive project directory from '{projectPath}'.");
+
+        for (var i = 0; i < 250; i++)
+        {
+            var sourcePath = Path.Combine(projectDirectory, $"Generated{i:D3}.cs");
+            File.WriteAllText(sourcePath, $$"""
+                namespace TempSolution;
+
+                public sealed class Generated{{i:D3}}
+                {
+                    public int Value => {{i}};
+                }
+                """);
+        }
+
+        WriteSolution(solutionPath, "Large", "src/Large/Large.csproj", "33333333-3333-3333-3333-333333333333");
+        DeleteDatabaseFiles(databasePath);
+        TryDelete(exportPath);
+
+        try
+        {
+            var result = await RunCliAsync(
+                GetRepositoryRoot(),
+                "exportjson",
+                exportPath,
+                "--solution",
+                solutionPath,
+                "--db",
+                databasePath);
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+            Assert.True(File.Exists(exportPath));
+
+            var exportedJson = await File.ReadAllTextAsync(exportPath);
+            var exportedPayload = ParseJson(exportedJson);
+            var entities = GetPropertyIgnoreCase(exportedPayload, "entities").EnumerateArray().ToArray();
+            var v1Files = entities.Single(entity => string.Equals(GetPropertyIgnoreCase(entity, "name").GetString(), "v1_files", StringComparison.OrdinalIgnoreCase));
+            var v1FilesRows = GetPropertyIgnoreCase(v1Files, "rows").EnumerateArray().ToArray();
+
+            Assert.True(v1FilesRows.Length >= 251);
+        }
+        finally
+        {
+            DeleteDatabaseFiles(databasePath);
+            TryDelete(exportPath);
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SimpleSchemaCommand_ReturnsQueryFocusedFieldsAndKnownConstants()
     {
         var sampleRoot = CreateTemporarySampleSolutionCopy();
@@ -578,6 +643,39 @@ public sealed class CliUsabilityTests
     }
 
     [Fact]
+    public async Task ScanCommand_UnknownOption_ReturnsError()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "scan", "--soluton", "tests/sample_solution");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Unknown option '--soluton'", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SqlCommand_MissingQueryValue_ReturnsExplicitError()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "sql", "--query", "--db", "temp.db.sqlite");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Option '--query' requires a value", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task ScanCommand_MissingDbValue_ReturnsExplicitError()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "scan", "--db");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(1, result.ExitCode);
+        Assert.False(payload.GetProperty("success").GetBoolean());
+        Assert.Contains("Option '--db' requires a value", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
     public async Task SqlCommand_InvalidMaxRowsValue_ReturnsError()
     {
         var sampleRoot = GetSampleSolutionRoot();
@@ -644,7 +742,7 @@ public sealed class CliUsabilityTests
 
         Assert.Equal(1, result.ExitCode);
         Assert.False(payload.GetProperty("success").GetBoolean());
-        Assert.Contains("Unsupported option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Unknown option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("--db", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -656,7 +754,7 @@ public sealed class CliUsabilityTests
 
         Assert.Equal(1, result.ExitCode);
         Assert.False(payload.GetProperty("success").GetBoolean());
-        Assert.Contains("Unsupported option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+        Assert.Contains("Unknown option", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
         Assert.Contains("--changed-only", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
     }
 
@@ -708,6 +806,44 @@ public sealed class CliUsabilityTests
                 .EnumerateArray()
                 .ToArray();
             Assert.NotEmpty(entities);
+        }
+        finally
+        {
+            DeleteDatabaseFiles(dbPath);
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanCommand_WithExistingNonLangQueryDatabase_RefusesMutation()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-foreign-db", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+        var dbPath = Path.Combine(tempDirectory, "foreign.db.sqlite");
+
+        try
+        {
+            await CreateForeignDatabaseAsync(dbPath);
+
+            var result = await RunCliAsync(
+                GetRepositoryRoot(),
+                "scan",
+                "--solution",
+                GetSampleSolutionRoot(),
+                "--db",
+                dbPath);
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(1, result.ExitCode);
+            Assert.False(payload.GetProperty("success").GetBoolean());
+            Assert.Contains("not a LangQuery database", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+
+            await using var verifyConnection = new SqliteConnection($"Data Source={dbPath}");
+            await verifyConnection.OpenAsync(CancellationToken.None);
+            await using var verifyCommand = verifyConnection.CreateCommand();
+            verifyCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'notes';";
+            var notesTableCount = Convert.ToInt32(await verifyCommand.ExecuteScalarAsync(CancellationToken.None));
+            Assert.Equal(1, notesTableCount);
         }
         finally
         {
@@ -989,10 +1125,21 @@ public sealed class CliUsabilityTests
 
     private static void TryDelete(string path)
     {
+        SqliteConnection.ClearAllPools();
+
         if (File.Exists(path))
         {
             File.Delete(path);
         }
+    }
+
+    private static async Task CreateForeignDatabaseAsync(string path)
+    {
+        await using var connection = new SqliteConnection($"Data Source={path}");
+        await connection.OpenAsync(CancellationToken.None);
+        await using var command = connection.CreateCommand();
+        command.CommandText = "CREATE TABLE notes(id INTEGER PRIMARY KEY, content TEXT NOT NULL);";
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
     private sealed record CliRunResult(int ExitCode, string StdOut, string StdErr);

@@ -7,6 +7,7 @@ using LangQuery.Core.Services;
 using LangQuery.Query.Validation;
 using LangQuery.Roslyn.Extraction;
 using LangQuery.Storage.Sqlite.Storage;
+using Microsoft.Data.Sqlite;
 
 return await RunAsync(args).ConfigureAwait(false);
 
@@ -253,14 +254,7 @@ static async Task<int> HandleExportJsonAsync(ParsedArgs parsed, LangQueryService
         Directory.CreateDirectory(exportDirectory);
     }
 
-    var exportPayload = await BuildDatabaseExportPayloadAsync(service, databasePath, CancellationToken.None).ConfigureAwait(false);
-    var exportJson = JsonSerializer.Serialize(exportPayload, new JsonSerializerOptions
-    {
-        Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
-        WriteIndented = parsed.Pretty
-    });
-
-    await File.WriteAllTextAsync(fullExportPath, exportJson, CancellationToken.None).ConfigureAwait(false);
+    var exportedEntityCount = await WriteDatabaseExportJsonAsync(databasePath, fullExportPath, parsed.Pretty, CancellationToken.None).ConfigureAwait(false);
 
     WriteOutput(new
     {
@@ -270,7 +264,7 @@ static async Task<int> HandleExportJsonAsync(ParsedArgs parsed, LangQueryService
         {
             database_path = Path.GetFullPath(databasePath),
             export_path = fullExportPath,
-            entities = exportPayload.Entities.Count
+            entities = exportedEntityCount
         }
     }, parsed.Pretty);
 
@@ -524,38 +518,95 @@ LangQuery indexes a C# solution into a local SQLite database and exposes stable 
 """;
 }
 
-static async Task<DatabaseExportPayload> BuildDatabaseExportPayloadAsync(LangQueryService service, string databasePath, CancellationToken cancellationToken)
+static async Task<int> WriteDatabaseExportJsonAsync(string databasePath, string exportPath, bool pretty, CancellationToken cancellationToken)
 {
     const string entityDiscoverySql = "SELECT name, type, IFNULL(sql, '') AS sql FROM sqlite_master WHERE type IN ('table', 'view') AND name NOT LIKE 'sqlite_%' ORDER BY type, name";
-    const int exportTimeoutMs = 60_000;
+    var fullDatabasePath = Path.GetFullPath(databasePath);
 
-    var entitiesResult = await service.QueryAsync(new QueryOptions(databasePath, entityDiscoverySql, int.MaxValue, exportTimeoutMs), cancellationToken).ConfigureAwait(false);
-    var entities = new List<DatabaseExportEntity>();
-
-    foreach (var entity in entitiesResult.Rows)
+    await using var connection = new SqliteConnection(new SqliteConnectionStringBuilder
     {
-        var name = GetStringValue(entity, "name");
-        var type = GetStringValue(entity, "type");
-        var sql = GetStringValue(entity, "sql");
+        DataSource = fullDatabasePath,
+        Mode = SqliteOpenMode.ReadOnly,
+        Pooling = true
+    }.ConnectionString);
+    await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
 
-        var entityResult = await service.QueryAsync(
-            new QueryOptions(databasePath, $"SELECT * FROM \"{EscapeSqliteIdentifier(name)}\"", int.MaxValue, exportTimeoutMs),
-            cancellationToken).ConfigureAwait(false);
-
-        entities.Add(new DatabaseExportEntity(name, type, sql, entityResult.Columns, entityResult.Rows));
+    var entities = new List<(string Name, string Type, string Sql)>();
+    await using (var entityCommand = connection.CreateCommand())
+    {
+        entityCommand.CommandText = entityDiscoverySql;
+        await using var entityReader = await entityCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+        while (await entityReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            entities.Add((
+                Name: entityReader.GetString(0),
+                Type: entityReader.GetString(1),
+                Sql: entityReader.GetString(2)));
+        }
     }
 
-    return new DatabaseExportPayload(Path.GetFullPath(databasePath), DateTimeOffset.UtcNow, entities);
+    await using var stream = new FileStream(exportPath, FileMode.Create, FileAccess.Write, FileShare.None, bufferSize: 128 * 1024, useAsync: true);
+    await using var writer = new Utf8JsonWriter(stream, new JsonWriterOptions { Indented = pretty });
+
+    writer.WriteStartObject();
+    writer.WriteString(nameof(DatabaseExportPayload.DatabasePath), fullDatabasePath);
+    writer.WriteString(nameof(DatabaseExportPayload.ExportedUtc), DateTimeOffset.UtcNow);
+    writer.WritePropertyName(nameof(DatabaseExportPayload.Entities));
+    writer.WriteStartArray();
+
+    foreach (var entity in entities)
+    {
+        writer.WriteStartObject();
+        writer.WriteString(nameof(DatabaseExportEntity.Name), entity.Name);
+        writer.WriteString(nameof(DatabaseExportEntity.Type), entity.Type);
+        writer.WriteString(nameof(DatabaseExportEntity.Sql), entity.Sql);
+        writer.WritePropertyName(nameof(DatabaseExportEntity.Columns));
+
+        var escapedEntityName = EscapeSqliteIdentifier(entity.Name);
+        await using var dataCommand = connection.CreateCommand();
+        dataCommand.CommandText = $"SELECT * FROM \"{escapedEntityName}\"";
+        await using var dataReader = await dataCommand.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
+
+        writer.WriteStartArray();
+        for (var i = 0; i < dataReader.FieldCount; i++)
+        {
+            writer.WriteStringValue(dataReader.GetName(i));
+        }
+        writer.WriteEndArray();
+
+        writer.WritePropertyName(nameof(DatabaseExportEntity.Rows));
+        writer.WriteStartArray();
+        while (await dataReader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        {
+            writer.WriteStartObject();
+            for (var i = 0; i < dataReader.FieldCount; i++)
+            {
+                writer.WritePropertyName(dataReader.GetName(i));
+                if (dataReader.IsDBNull(i))
+                {
+                    writer.WriteNullValue();
+                }
+                else
+                {
+                    JsonSerializer.Serialize(writer, dataReader.GetValue(i));
+                }
+            }
+            writer.WriteEndObject();
+        }
+        writer.WriteEndArray();
+        writer.WriteEndObject();
+    }
+
+    writer.WriteEndArray();
+    writer.WriteEndObject();
+    await writer.FlushAsync(cancellationToken).ConfigureAwait(false);
+
+    return entities.Count;
 }
 
 static string EscapeSqliteIdentifier(string value)
 {
     return value.Replace("\"", "\"\"", StringComparison.Ordinal);
-}
-
-static string GetStringValue(IReadOnlyDictionary<string, object?> row, string key)
-{
-    return row.TryGetValue(key, out var value) ? Convert.ToString(value) ?? string.Empty : string.Empty;
 }
 
 static SimpleSchemaPayload BuildSimpleSchema(SchemaDescription schema)
@@ -1145,6 +1196,7 @@ static ParsedArgs ParseArgs(string[] args)
 
 static ParsedArgs ParseOptions(string command, string[] args, int startIndex)
 {
+    var commandSpec = GetCommandSpec(command);
     var options = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
     var flags = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
@@ -1176,17 +1228,70 @@ static ParsedArgs ParseOptions(string command, string[] args, int startIndex)
             return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: "Option name cannot be empty.");
         }
 
-        if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+        if (commandSpec.FlagOptions.Contains(name))
         {
+            if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{name}' does not accept a value.");
+            }
+
+            flags.Add(name);
+            continue;
+        }
+
+        if (commandSpec.ValueOptions.Contains(name))
+        {
+            if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
+            {
+                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{name}' requires a value.");
+            }
+
             options[name] = args[i + 1];
             i++;
             continue;
         }
 
-        flags.Add(name);
+        return new ParsedArgs(
+            command,
+            options,
+            flags,
+            Pretty: flags.Contains("pretty"),
+            Error: $"Unknown option '--{name}' for command '{command}'.");
     }
 
     return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: null);
+}
+
+static CommandSpec GetCommandSpec(string command)
+{
+    var normalized = command.ToLowerInvariant();
+    return normalized switch
+    {
+        "scan" => new CommandSpec(
+            ValueOptions: ["solution", "db"],
+            FlagOptions: ["changed-only", "pretty"]),
+        "sql" => new CommandSpec(
+            ValueOptions: ["query", "solution", "db", "max-rows", "timeout-ms"],
+            FlagOptions: ["pretty"]),
+        "schema" => new CommandSpec(
+            ValueOptions: ["solution", "db"],
+            FlagOptions: ["pretty"]),
+        "simpleschema" => new CommandSpec(
+            ValueOptions: ["solution", "db"],
+            FlagOptions: ["pretty"]),
+        "exportjson" => new CommandSpec(
+            ValueOptions: ["solution", "db"],
+            FlagOptions: ["pretty"]),
+        "installskill" => new CommandSpec(
+            ValueOptions: Array.Empty<string>(),
+            FlagOptions: ["pretty"]),
+        "help" or "examples" or "info" => new CommandSpec(
+            ValueOptions: Array.Empty<string>(),
+            FlagOptions: ["pretty"]),
+        _ => new CommandSpec(
+            ValueOptions: Array.Empty<string>(),
+            FlagOptions: ["pretty"])
+    };
 }
 
 static bool IsKnownCommand(string command)
@@ -1219,6 +1324,10 @@ internal sealed record ParsedArgs(
     HashSet<string> Flags,
     bool Pretty,
     string? Error);
+
+internal sealed record CommandSpec(
+    IReadOnlyCollection<string> ValueOptions,
+    IReadOnlyCollection<string> FlagOptions);
 
 internal sealed record ResolvedSolution(string FilePath, string DirectoryPath, string Name);
 

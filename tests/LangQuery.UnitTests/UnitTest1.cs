@@ -2,6 +2,7 @@ using LangQuery.Core.Models;
 using LangQuery.Query.Validation;
 using LangQuery.Storage.Sqlite.Storage;
 using Microsoft.Data.Sqlite;
+using System.Diagnostics;
 using System.Globalization;
 
 namespace LangQuery.UnitTests;
@@ -141,7 +142,8 @@ public sealed class SqliteStorageEngineTests
                 new QueryOptions(databasePath, "SELECT key, value FROM meta_capabilities ORDER BY key", MaxRows: 10),
                 CancellationToken.None);
 
-            Assert.Equal(3, result.Rows.Count);
+            Assert.Equal(4, result.Rows.Count);
+            Assert.Contains(result.Rows, row => Equals(row["key"], "owner") && Equals(row["value"], "langquery"));
             Assert.Contains(result.Rows, row => Equals(row["key"], "languages") && Equals(row["value"], "csharp"));
             Assert.Contains(result.Rows, row => Equals(row["key"], "public_views") && Equals(row["value"], "v1"));
             Assert.Contains(result.Rows, row => Equals(row["key"], "sql_mode") && Equals(row["value"], "read-only"));
@@ -449,6 +451,66 @@ public sealed class SqliteStorageEngineTests
     }
 
     [Fact]
+    public async Task ExecuteReadOnlyQueryAsync_WhenColumnsShareName_PreservesAllValuesInRow()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var result = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT 1 AS duplicate, 2 AS duplicate, 3 AS DUPLICATE", MaxRows: 10),
+                CancellationToken.None);
+
+            Assert.Equal(3, result.Columns.Count);
+            Assert.Equal("duplicate", result.Columns[0]);
+            Assert.Equal("duplicate", result.Columns[1]);
+            Assert.Equal("DUPLICATE", result.Columns[2]);
+
+            var row = Assert.Single(result.Rows);
+            Assert.Equal(1L, Convert.ToInt64(row["duplicate"], CultureInfo.InvariantCulture));
+            Assert.Equal(2L, Convert.ToInt64(row["duplicate_2"], CultureInfo.InvariantCulture));
+            Assert.Equal(3L, Convert.ToInt64(row["duplicate_3"], CultureInfo.InvariantCulture));
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task ExecuteReadOnlyQueryAsync_TimeoutMs_UsesMillisecondPrecision()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            var stopwatch = Stopwatch.StartNew();
+            var error = await Assert.ThrowsAsync<TimeoutException>(() =>
+                storage.ExecuteReadOnlyQueryAsync(
+                    new QueryOptions(
+                        databasePath,
+                        "WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM cnt WHERE x < 1000000000) SELECT x FROM cnt",
+                        MaxRows: int.MaxValue,
+                        TimeoutMs: 10),
+                    CancellationToken.None));
+            stopwatch.Stop();
+
+            Assert.Contains("10 ms", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromMilliseconds(900), $"Expected timeout near 10ms but elapsed {stopwatch.Elapsed.TotalMilliseconds:F0}ms.");
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
     public async Task ExecuteReadOnlyQueryAsync_WhenMaxRowsIsZero_StillReturnsSingleRowAndMarksTruncated()
     {
         var databasePath = CreateTempDatabasePath();
@@ -484,6 +546,88 @@ public sealed class SqliteStorageEngineTests
             var schema = await storage.DescribeSchemaAsync(databasePath, CancellationToken.None);
 
             Assert.Contains(schema.Entities, entity => entity.Name == "meta_scan_state" && entity.Kind == "table");
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeAsync_RejectsExistingNonLangQueryDatabase()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var parentDirectory = Path.GetDirectoryName(databasePath)
+                                  ?? throw new DirectoryNotFoundException($"Could not derive parent directory from '{databasePath}'.");
+            Directory.CreateDirectory(parentDirectory);
+
+            await using (var connection = new SqliteConnection($"Data Source={databasePath}"))
+            {
+                await connection.OpenAsync(CancellationToken.None);
+                await using var command = connection.CreateCommand();
+                command.CommandText = "CREATE TABLE notes(id INTEGER PRIMARY KEY, content TEXT NOT NULL);";
+                await command.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+
+            var storage = CreateStorage();
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => storage.InitializeAsync(databasePath, CancellationToken.None));
+
+            Assert.Contains("not a LangQuery database", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("--db", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenMigrationFails_RollsBackPartialSchemaChanges()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var parentDirectory = Path.GetDirectoryName(databasePath)
+                                  ?? throw new DirectoryNotFoundException($"Could not derive parent directory from '{databasePath}'.");
+            Directory.CreateDirectory(parentDirectory);
+
+            await using (var connection = new SqliteConnection($"Data Source={databasePath}"))
+            {
+                await connection.OpenAsync(CancellationToken.None);
+                await using var setup = connection.CreateCommand();
+                setup.CommandText = "CREATE TABLE meta_schema_version(version INTEGER NOT NULL, applied_utc TEXT NOT NULL);"
+                                  + "INSERT INTO meta_schema_version(version, applied_utc) VALUES (0, '1970-01-01T00:00:00.0000000+00:00');"
+                                  + "CREATE TABLE meta_capabilities(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+                                  + "INSERT INTO meta_capabilities(key, value) VALUES ('owner', 'langquery');"
+                                  + "CREATE TABLE lines(id INTEGER PRIMARY KEY AUTOINCREMENT, file_id INTEGER NOT NULL, line_number INTEGER NOT NULL, text TEXT NOT NULL);";
+                await setup.ExecuteNonQueryAsync(CancellationToken.None);
+            }
+
+            var storage = CreateStorage();
+            await Assert.ThrowsAnyAsync<SqliteException>(() => storage.InitializeAsync(databasePath, CancellationToken.None));
+
+            await using var verifyConnection = new SqliteConnection($"Data Source={databasePath}");
+            await verifyConnection.OpenAsync(CancellationToken.None);
+
+            await using var metaScanStateCommand = verifyConnection.CreateCommand();
+            metaScanStateCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta_scan_state';";
+            var metaScanStateCount = Convert.ToInt32(await metaScanStateCommand.ExecuteScalarAsync(CancellationToken.None), CultureInfo.InvariantCulture);
+
+            await using var methodsCommand = verifyConnection.CreateCommand();
+            methodsCommand.CommandText = "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'methods';";
+            var methodsCount = Convert.ToInt32(await methodsCommand.ExecuteScalarAsync(CancellationToken.None), CultureInfo.InvariantCulture);
+
+            await using var schemaVersionCommand = verifyConnection.CreateCommand();
+            schemaVersionCommand.CommandText = "SELECT version FROM meta_schema_version ORDER BY version DESC LIMIT 1;";
+            var schemaVersion = Convert.ToInt32(await schemaVersionCommand.ExecuteScalarAsync(CancellationToken.None), CultureInfo.InvariantCulture);
+
+            Assert.Equal(0, metaScanStateCount);
+            Assert.Equal(0, methodsCount);
+            Assert.Equal(0, schemaVersion);
         }
         finally
         {

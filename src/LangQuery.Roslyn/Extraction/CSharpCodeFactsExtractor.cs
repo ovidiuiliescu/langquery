@@ -3,6 +3,7 @@ using LangQuery.Core.Models;
 using Microsoft.CodeAnalysis;
 using Microsoft.CodeAnalysis.CSharp;
 using Microsoft.CodeAnalysis.CSharp.Syntax;
+using Microsoft.CodeAnalysis.Text;
 using System.Reflection;
 using System.Runtime.CompilerServices;
 
@@ -43,24 +44,45 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         foreach (var context in methods)
         {
             var methodVariables = ExtractVariablesForImplementation(context.Node, context.Fact.MethodKey);
-            foreach (var variable in methodVariables)
+            foreach (var variable in methodVariables.Select(x => x.Fact))
             {
                 variables.Add(variable);
             }
 
             var variablesByName = methodVariables
-                .GroupBy(x => x.Name, StringComparer.Ordinal)
-                .ToDictionary(g => g.Key, g => g.OrderBy(v => v.DeclarationLine).ToArray(), StringComparer.Ordinal);
+                .GroupBy(x => x.Fact.Name, StringComparer.Ordinal)
+                .ToDictionary(g => g.Key, g => g.Select(x => x.Fact).OrderBy(v => v.DeclarationLine).ToArray(), StringComparer.Ordinal);
+            var variablesByDeclarationSpan = methodVariables
+                .ToDictionary(
+                    x => BuildSpanKey(x.DeclarationNode.Span),
+                    x => x.Fact,
+                    StringComparer.Ordinal);
 
             foreach (var identifier in EnumerateOwnedDescendants<IdentifierNameSyntax>(context.Node))
             {
                 var symbolName = identifier.Identifier.ValueText;
                 var lineNumber = tree.GetLineSpan(identifier.Span).StartLinePosition.Line + 1;
                 var depth = ComputeBlockDepth(identifier, context.Node);
+                var symbolInfo = semanticModel.GetSymbolInfo(identifier);
+                var symbol = symbolInfo.Symbol ?? symbolInfo.CandidateSymbols.FirstOrDefault();
 
                 UpdateDepth(blockDepthByMethodAndLine, context.Fact.MethodKey, lineNumber, depth);
 
-                if (variablesByName.TryGetValue(symbolName, out var candidates))
+                var resolvedVariable = ResolveVariableBySymbol(symbol, variablesByDeclarationSpan);
+                if (resolvedVariable is not null)
+                {
+                    AddLineVariableUsage(variableCountByMethodAndLine, context.Fact.MethodKey, lineNumber, symbolName);
+                    lineVariables.Add(new LineVariableFact(lineNumber, context.Fact.MethodKey, symbolName, resolvedVariable.VariableKey));
+                    symbolRefs.Add(new SymbolReferenceFact(
+                        lineNumber,
+                        context.Fact.MethodKey,
+                        symbolName,
+                        "Variable",
+                        SymbolContainerTypeName: null,
+                        SymbolTypeName: resolvedVariable.TypeName));
+                }
+                else if ((symbol is ILocalSymbol || symbol is IParameterSymbol)
+                    && variablesByName.TryGetValue(symbolName, out var candidates))
                 {
                     AddLineVariableUsage(variableCountByMethodAndLine, context.Fact.MethodKey, lineNumber, symbolName);
                     var selected = SelectBestVariable(candidates, lineNumber);
@@ -323,7 +345,7 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
                 method.ReturnType.ToString(),
                 "Method",
                 method.Modifiers,
-                IsInsideInterface(node) ? "Public" : "Private"),
+                ResolveDefaultMethodAccessModifier(node)),
 
             ConstructorDeclarationSyntax constructor => (
                 constructor.Identifier.ValueText,
@@ -364,9 +386,9 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         };
     }
 
-    private static IReadOnlyList<VariableFact> ExtractVariablesForImplementation(SyntaxNode implementationNode, string methodKey)
+    private static IReadOnlyList<VariableContext> ExtractVariablesForImplementation(SyntaxNode implementationNode, string methodKey)
     {
-        var variables = new List<VariableFact>();
+        var variables = new List<VariableContext>();
 
         foreach (var parameter in GetParametersForImplementation(implementationNode))
         {
@@ -379,7 +401,9 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             var line = implementationNode.SyntaxTree.GetLineSpan(parameter.Span).StartLinePosition.Line + 1;
             var typeName = parameter.Type?.ToString();
             var variableKey = BuildVariableKey(methodKey, name, line, "Parameter");
-            variables.Add(new VariableFact(variableKey, methodKey, name, "Parameter", typeName, line));
+            variables.Add(new VariableContext(
+                new VariableFact(variableKey, methodKey, name, "Parameter", typeName, line),
+                parameter));
         }
 
         foreach (var declaration in EnumerateOwnedDescendants<VariableDeclaratorSyntax>(implementationNode))
@@ -393,7 +417,9 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             var line = implementationNode.SyntaxTree.GetLineSpan(declaration.Span).StartLinePosition.Line + 1;
             var typeName = (declaration.Parent as VariableDeclarationSyntax)?.Type.ToString();
             var variableKey = BuildVariableKey(methodKey, name, line, "Local");
-            variables.Add(new VariableFact(variableKey, methodKey, name, "Local", typeName, line));
+            variables.Add(new VariableContext(
+                new VariableFact(variableKey, methodKey, name, "Local", typeName, line),
+                declaration));
         }
 
         foreach (var foreachStatement in EnumerateOwnedDescendants<ForEachStatementSyntax>(implementationNode))
@@ -407,7 +433,9 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             var line = implementationNode.SyntaxTree.GetLineSpan(foreachStatement.Identifier.Span).StartLinePosition.Line + 1;
             var typeName = foreachStatement.Type?.ToString();
             var variableKey = BuildVariableKey(methodKey, name, line, "ForEach");
-            variables.Add(new VariableFact(variableKey, methodKey, name, "ForEach", typeName, line));
+            variables.Add(new VariableContext(
+                new VariableFact(variableKey, methodKey, name, "ForEach", typeName, line),
+                foreachStatement));
         }
 
         foreach (var catchDeclaration in EnumerateOwnedDescendants<CatchDeclarationSyntax>(implementationNode))
@@ -421,7 +449,9 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
             var line = implementationNode.SyntaxTree.GetLineSpan(catchDeclaration.Identifier.Span).StartLinePosition.Line + 1;
             var typeName = catchDeclaration.Type?.ToString();
             var variableKey = BuildVariableKey(methodKey, name, line, "Catch");
-            variables.Add(new VariableFact(variableKey, methodKey, name, "Catch", typeName, line));
+            variables.Add(new VariableContext(
+                new VariableFact(variableKey, methodKey, name, "Catch", typeName, line),
+                catchDeclaration));
         }
 
         return variables;
@@ -794,8 +824,13 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
 
     private static string ResolveDefaultTypeAccessModifier(SyntaxNode typeNode)
     {
-        var isNested = typeNode.Ancestors().Any(IsSupportedTypeNode);
-        return isNested ? "Private" : "Internal";
+        var containingType = typeNode.Ancestors().FirstOrDefault(IsSupportedTypeNode);
+        if (containingType is null)
+        {
+            return "Internal";
+        }
+
+        return containingType is InterfaceDeclarationSyntax ? "Public" : "Private";
     }
 
     private static string ResolveAccessModifier(SyntaxTokenList modifiers, string fallback)
@@ -900,9 +935,10 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         };
     }
 
-    private static bool IsInsideInterface(SyntaxNode node)
+    private static string ResolveDefaultMethodAccessModifier(SyntaxNode node)
     {
-        return node.Ancestors().Any(ancestor => ancestor is InterfaceDeclarationSyntax);
+        var containingType = node.Ancestors().FirstOrDefault(ancestor => ancestor is TypeDeclarationSyntax);
+        return containingType is InterfaceDeclarationSyntax ? "Public" : "Private";
     }
 
     private static string ToPascal(string value)
@@ -922,9 +958,7 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
 
     private static string BuildTypeKey(SyntaxNode typeNode, int line, string name)
     {
-        var namespaceName = typeNode.Ancestors().OfType<BaseNamespaceDeclarationSyntax>()
-            .Select(ns => ns.Name.ToString())
-            .FirstOrDefault();
+        var namespaceName = BuildNamespaceName(typeNode);
 
         var path = namespaceName is null ? name : $"{namespaceName}.{name}";
         return $"{path}@{line}";
@@ -932,9 +966,7 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
 
     private static string BuildFullTypeName(SyntaxNode typeNode, string typeName)
     {
-        var namespaceName = typeNode.Ancestors().OfType<BaseNamespaceDeclarationSyntax>()
-            .Select(ns => ns.Name.ToString())
-            .FirstOrDefault();
+        var namespaceName = BuildNamespaceName(typeNode);
 
         var parentTypes = typeNode.Ancestors()
             .Where(IsSupportedTypeNode)
@@ -966,6 +998,43 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
         return $"{methodKey}:{kind}:{variableName}@{declarationLine}";
     }
 
+    private static VariableFact? ResolveVariableBySymbol(
+        ISymbol? symbol,
+        IReadOnlyDictionary<string, VariableFact> variablesByDeclarationSpan)
+    {
+        if (symbol is not ILocalSymbol && symbol is not IParameterSymbol)
+        {
+            return null;
+        }
+
+        var declaration = symbol.DeclaringSyntaxReferences.FirstOrDefault()?.GetSyntax();
+        if (declaration is null)
+        {
+            return null;
+        }
+
+        var declarationSpanKey = BuildSpanKey(declaration.Span);
+        return variablesByDeclarationSpan.TryGetValue(declarationSpanKey, out var variable)
+            ? variable
+            : null;
+    }
+
+    private static string BuildSpanKey(TextSpan span)
+    {
+        return $"{span.Start}:{span.End}";
+    }
+
+    private static string? BuildNamespaceName(SyntaxNode node)
+    {
+        var namespaceParts = node.Ancestors()
+            .OfType<BaseNamespaceDeclarationSyntax>()
+            .Select(ns => ns.Name.ToString())
+            .Reverse()
+            .ToArray();
+
+        return namespaceParts.Length == 0 ? null : string.Join('.', namespaceParts);
+    }
+
     private static string ResolveRelationKind(TypeDeclarationSyntax typeDeclaration, int baseTypeIndex)
     {
         if (typeDeclaration is InterfaceDeclarationSyntax)
@@ -991,6 +1060,8 @@ public sealed class CSharpCodeFactsExtractor : ICodeFactsExtractor
     private sealed record MethodContext(SyntaxNode Node, MethodFact Fact);
 
     private sealed record MethodRange(string MethodKey, int LineStart, int LineEnd);
+
+    private sealed record VariableContext(VariableFact Fact, SyntaxNode DeclarationNode);
 
     private sealed record SymbolReferenceDetails(
         string? SymbolKind,
