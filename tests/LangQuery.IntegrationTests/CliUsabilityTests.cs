@@ -531,6 +531,51 @@ public sealed class CliUsabilityTests
     }
 
     [Fact]
+    public async Task ExportJsonCommand_WithExistingDb_DoesNotRequireSolution()
+    {
+        var tempDirectory = Path.Combine(Path.GetTempPath(), "langquery-export-existing-db", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(tempDirectory);
+
+        var databasePath = Path.Combine(tempDirectory, "existing.db.sqlite");
+        var exportPath = Path.Combine(tempDirectory, "existing-export.json");
+        DeleteDatabaseFiles(databasePath);
+        TryDelete(exportPath);
+
+        try
+        {
+            var scanResult = await RunCliAsync(
+                GetRepositoryRoot(),
+                "scan",
+                "--solution",
+                GetSampleSolutionRoot(),
+                "--db",
+                databasePath);
+            var scanPayload = ParseJson(scanResult.StdOut);
+            Assert.Equal(0, scanResult.ExitCode);
+            Assert.True(scanPayload.GetProperty("success").GetBoolean());
+
+            var exportResult = await RunCliAsync(
+                tempDirectory,
+                "exportjson",
+                exportPath,
+                "--db",
+                databasePath);
+            var exportPayload = ParseJson(exportResult.StdOut);
+
+            Assert.Equal(0, exportResult.ExitCode);
+            Assert.True(exportPayload.GetProperty("success").GetBoolean());
+            Assert.Equal("exportjson", exportPayload.GetProperty("command").GetString());
+            Assert.True(File.Exists(exportPath));
+        }
+        finally
+        {
+            DeleteDatabaseFiles(databasePath);
+            TryDelete(exportPath);
+            Directory.Delete(tempDirectory, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task SimpleSchemaCommand_ReturnsQueryFocusedFieldsAndKnownConstants()
     {
         var sampleRoot = CreateTemporarySampleSolutionCopy();
@@ -697,6 +742,42 @@ public sealed class CliUsabilityTests
         Assert.Equal(1, result.ExitCode);
         Assert.False(payload.GetProperty("success").GetBoolean());
         Assert.Contains("--timeout-ms", GetPropertyIgnoreCase(payload, "error").GetString() ?? string.Empty, StringComparison.OrdinalIgnoreCase);
+    }
+
+    [Fact]
+    public async Task SqlCommand_OptionNames_AreCaseInsensitive()
+    {
+        var sampleRoot = GetSampleSolutionRoot();
+        var databasePath = Path.Combine(Path.GetTempPath(), "langquery-case-options", Guid.NewGuid().ToString("N"), "case.db.sqlite");
+        DeleteDatabaseFiles(databasePath);
+
+        try
+        {
+            var result = await RunCliAsync(
+                GetRepositoryRoot(),
+                "sql",
+                "--SoLuTiOn",
+                sampleRoot,
+                "--DB",
+                databasePath,
+                "--QuErY",
+                "SELECT 1 AS c",
+                "--MAX-ROWS",
+                "1",
+                "--TIMEOUT-MS",
+                "1000",
+                "--PrEtTy");
+            var payload = ParseJson(result.StdOut);
+
+            Assert.Equal(0, result.ExitCode);
+            Assert.True(payload.GetProperty("success").GetBoolean());
+            Assert.Equal("sql", payload.GetProperty("command").GetString());
+            Assert.Equal(1, ReadSingleCount(payload));
+        }
+        finally
+        {
+            DeleteDatabaseFiles(databasePath);
+        }
     }
 
     [Fact]

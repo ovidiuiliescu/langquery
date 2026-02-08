@@ -172,3 +172,23 @@ This plan expands test coverage for LangQuery with a focus on:
 - Any previous tests relying on empty `tests/sample_solution/SampleSolution.sln` will be rewritten to use a temp empty solution fixture.
 - Assertions will favor behavior invariants over brittle hardcoded totals when fixture size grows.
 - Full validation run after implementation: `dotnet test LangQuery.sln`.
+
+## Second Round (10 Issues)
+
+### Group A - Project discovery correctness/security
+- [x] A1. Block `Compile Include` paths that escape solution root.
+- [x] A2. Support prefixed recursive globs like `src/**/*.cs`.
+- [x] A3. Honor explicit includes under ignored folder names.
+
+### Group B - Storage initialization robustness
+- [x] B1. Allow read-only query/schema initialization path.
+- [x] B2. Reject unsupported future schema versions.
+- [x] B3. Add lock resiliency (`busy_timeout` + retry) for contention.
+
+### Group C - Query contract + validator correctness
+- [x] C1. Allow bracket/backtick quoted identifiers in SQL safety validator.
+- [x] C2. Keep `Columns` aligned with deduped row keys for duplicate aliases.
+
+### Group D - CLI behavior consistency
+- [x] D1. Make option names case-insensitive.
+- [x] D2. Allow `exportjson --db <existing>` without requiring a solution.

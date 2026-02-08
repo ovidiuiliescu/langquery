@@ -133,6 +133,22 @@ public sealed class ReadOnlySqlSafetyValidatorTests
     }
 
     [Fact]
+    public void Validate_AllowsForbiddenWordsInsideBracketQuotedIdentifiers()
+    {
+        var result = _validator.Validate("SELECT [DELETE], [DROP] FROM [v1_files]");
+
+        Assert.True(result.IsValid);
+    }
+
+    [Fact]
+    public void Validate_AllowsForbiddenWordsInsideBacktickQuotedIdentifiers()
+    {
+        var result = _validator.Validate("SELECT `UPDATE`, `ALTER` FROM `v1_methods`");
+
+        Assert.True(result.IsValid);
+    }
+
+    [Fact]
     public void Validate_RejectsMultipleStatementsWhenTrailingContentExists()
     {
         var result = _validator.Validate("SELECT 1; -- done\nSELECT 2");

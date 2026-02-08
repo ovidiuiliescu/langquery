@@ -21,7 +21,7 @@ public sealed class LangQueryServiceTests
         var result = await service.QueryAsync(new QueryOptions("db.sqlite", "SELECT 1"), CancellationToken.None);
 
         Assert.Equal(2, storage.CallLog.Count);
-        Assert.Equal("Initialize", storage.CallLog[0]);
+        Assert.Equal("InitializeReadOnly", storage.CallLog[0]);
         Assert.Equal("ExecuteReadOnlyQuery", storage.CallLog[1]);
         Assert.Single(result.Rows);
     }
@@ -40,7 +40,7 @@ public sealed class LangQueryServiceTests
         var result = await service.GetSchemaAsync(new SchemaOptions("db.sqlite"), CancellationToken.None);
 
         Assert.Equal(2, storage.CallLog.Count);
-        Assert.Equal("Initialize", storage.CallLog[0]);
+        Assert.Equal("InitializeReadOnly", storage.CallLog[0]);
         Assert.Equal("DescribeSchema", storage.CallLog[1]);
         Assert.Equal(5, result.SchemaVersion);
     }
@@ -422,6 +422,111 @@ public sealed class LangQueryServiceTests
     }
 
     [Fact]
+    public async Task ScanAsync_SolutionScanRejectsCompileIncludesOutsideSolutionRoot()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "App", "A.cs"), "namespace Demo; class A {}")
+            ]);
+
+        var outsideRoot = Path.Combine(Path.GetTempPath(), "langquery-service-tests-outside", Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(Path.Combine(outsideRoot, "Escape"));
+        var outsideFilePath = Path.Combine(outsideRoot, "Escape", "Outside.cs");
+        File.WriteAllText(outsideFilePath, "namespace Demo; class Outside {}");
+
+        var appProjectPath = Path.Combine(workspace, "src", "App", "App.csproj");
+        var relativeOutsidePath = Path.GetRelativePath(Path.GetDirectoryName(appProjectPath)!, outsideFilePath).Replace('\\', '/');
+        var appProjectText = $"<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include=\"{relativeOutsidePath}\" /></ItemGroup></Project>";
+        File.WriteAllText(appProjectPath, appProjectText);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["src\\App\\App.csproj"]);
+
+        try
+        {
+            var service = new LangQueryService(new FakeExtractor(), new FakeStorageEngine());
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() =>
+                service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None));
+
+            Assert.Contains("Compile Include", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("outside the solution root", error.Message, StringComparison.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+            Directory.Delete(outsideRoot, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanSupportsPrefixedRecursiveCompileGlob()
+    {
+        var workspace = CreateWorkspace(
+            [
+                (Path.Combine("src", "Top.cs"), "namespace Demo; class Top {}"),
+                (Path.Combine("src", "Nested", "Inner.cs"), "namespace Demo; class Inner {}"),
+                ("Other.cs", "namespace Demo; class Other {}"),
+                ("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework><EnableDefaultCompileItems>false</EnableDefaultCompileItems></PropertyGroup><ItemGroup><Compile Include=\"src/**/*.cs\" /></ItemGroup></Project>")
+            ]);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["App.csproj"]);
+
+        try
+        {
+            var storage = new FakeStorageEngine();
+            var service = new LangQueryService(new FakeExtractor(), storage);
+
+            var summary = await service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None);
+
+            Assert.Equal(2, summary.FilesDiscovered);
+            Assert.Equal(2, summary.FilesScanned);
+            Assert.Contains(storage.LastPersistFacts, x => string.Equals(x.Path, Path.GetFullPath(Path.Combine(workspace, "src", "Top.cs")), StringComparison.OrdinalIgnoreCase));
+            Assert.Contains(storage.LastPersistFacts, x => string.Equals(x.Path, Path.GetFullPath(Path.Combine(workspace, "src", "Nested", "Inner.cs")), StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(storage.LastPersistFacts, x => string.Equals(x.Path, Path.GetFullPath(Path.Combine(workspace, "Other.cs")), StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
+    public async Task ScanAsync_SolutionScanHonorsExplicitCompileIncludesInIgnoredFolders()
+    {
+        var workspace = CreateWorkspace(
+            [
+                ("A.cs", "namespace Demo; class A {}"),
+                (Path.Combine("obj", "Explicit.cs"), "namespace Demo; class Explicit {}"),
+                (Path.Combine("bin", "DefaultIgnored.cs"), "namespace Demo; class DefaultIgnored {}"),
+                ("App.csproj", "<Project Sdk=\"Microsoft.NET.Sdk\"><PropertyGroup><TargetFramework>net8.0</TargetFramework></PropertyGroup><ItemGroup><Compile Include=\"obj/Explicit.cs\" /></ItemGroup></Project>")
+            ]);
+
+        var solutionPath = Path.Combine(workspace, "Demo.sln");
+        var databasePath = Path.Combine(workspace, "facts.db");
+        WriteSolutionFile(solutionPath, ["App.csproj"]);
+
+        try
+        {
+            var storage = new FakeStorageEngine();
+            var service = new LangQueryService(new FakeExtractor(), storage);
+
+            var summary = await service.ScanAsync(new ScanOptions(solutionPath, databasePath), CancellationToken.None);
+
+            Assert.Equal(2, summary.FilesDiscovered);
+            Assert.Equal(2, summary.FilesScanned);
+            Assert.Contains(storage.LastPersistFacts, x => string.Equals(x.Path, Path.GetFullPath(Path.Combine(workspace, "obj", "Explicit.cs")), StringComparison.OrdinalIgnoreCase));
+            Assert.DoesNotContain(storage.LastPersistFacts, x => string.Equals(x.Path, Path.GetFullPath(Path.Combine(workspace, "bin", "DefaultIgnored.cs")), StringComparison.OrdinalIgnoreCase));
+        }
+        finally
+        {
+            Directory.Delete(workspace, recursive: true);
+        }
+    }
+
+    [Fact]
     public async Task ScanAsync_SolutionScanUsesStaticParsingWithoutExecutingProjectTargets()
     {
         var workspace = CreateWorkspace(
@@ -603,6 +708,12 @@ public sealed class LangQueryServiceTests
         {
             CallLog.Add("GetIndexedFileHashes");
             return Task.FromResult(IndexedHashes);
+        }
+
+        public Task InitializeReadOnlyAsync(string databasePath, CancellationToken cancellationToken)
+        {
+            CallLog.Add("InitializeReadOnly");
+            return Task.CompletedTask;
         }
 
         public Task PersistFactsAsync(string databasePath, IReadOnlyList<FileFacts> facts, IReadOnlyCollection<string> removedPaths, bool fullRebuild, CancellationToken cancellationToken)

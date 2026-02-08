@@ -109,13 +109,29 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
 
     public async Task<QueryResult> QueryAsync(QueryOptions options, CancellationToken cancellationToken = default)
     {
-        await storageEngine.InitializeAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await storageEngine.InitializeReadOnlyAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException)
+        {
+            await storageEngine.InitializeAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        }
+
         return await storageEngine.ExecuteReadOnlyQueryAsync(options, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<SchemaDescription> GetSchemaAsync(SchemaOptions options, CancellationToken cancellationToken = default)
     {
-        await storageEngine.InitializeAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        try
+        {
+            await storageEngine.InitializeReadOnlyAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        }
+        catch (FileNotFoundException)
+        {
+            await storageEngine.InitializeAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
+        }
+
         return await storageEngine.DescribeSchemaAsync(options.DatabasePath, cancellationToken).ConfigureAwait(false);
     }
 
@@ -253,8 +269,8 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
 
         foreach (var item in document.Descendants().Where(static x => string.Equals(x.Name.LocalName, "Compile", StringComparison.Ordinal)))
         {
-            AddMatchesFromAttribute(item, "Include", projectDirectory, ".cs", explicitCompileIncludes);
-            AddMatchesFromAttribute(item, "Remove", projectDirectory, ".cs", explicitCompileRemoves);
+            AddMatchesFromAttribute(item, "Include", projectDirectory, ".cs", explicitCompileIncludes, projectPath, solutionDirectory, ensureWithinSolutionRoot: true);
+            AddMatchesFromAttribute(item, "Remove", projectDirectory, ".cs", explicitCompileRemoves, projectPath, solutionDirectory, ensureWithinSolutionRoot: false);
         }
 
         compileFiles.UnionWith(explicitCompileIncludes);
@@ -288,7 +304,10 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
         string attributeName,
         string projectDirectory,
         string extension,
-        ISet<string> result)
+        ISet<string> result,
+        string projectPath,
+        string solutionDirectory,
+        bool ensureWithinSolutionRoot)
     {
         var attribute = itemElement.Attributes().FirstOrDefault(x => string.Equals(x.Name.LocalName, attributeName, StringComparison.Ordinal));
         if (attribute is null || string.IsNullOrWhiteSpace(attribute.Value))
@@ -300,10 +319,12 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
         {
             foreach (var filePath in ExpandProjectPattern(rawPattern, projectDirectory, extension))
             {
-                if (!IsUnderIgnoredDirectory(filePath))
+                if (ensureWithinSolutionRoot)
                 {
-                    result.Add(filePath);
+                    EnsurePathWithinSolutionRoot(filePath, solutionDirectory, $"Compile {attributeName} '{rawPattern}' in '{projectPath}'");
                 }
+
+                result.Add(filePath);
             }
         }
     }
@@ -322,38 +343,94 @@ public sealed class LangQueryService(ICodeFactsExtractor extractor, IStorageEngi
             return Array.Empty<string>();
         }
 
-        if (normalizedPattern.StartsWith("**", StringComparison.Ordinal))
-        {
-            var suffix = normalizedPattern.TrimStart('*', Path.DirectorySeparatorChar);
-            var filePattern = Path.GetFileName(suffix);
-            if (string.IsNullOrWhiteSpace(filePattern))
-            {
-                filePattern = "*.cs";
-            }
-
-            return Directory
-                .EnumerateFiles(projectDirectory, filePattern, SearchOption.AllDirectories)
-                .Select(Path.GetFullPath)
-                .Where(path => string.Equals(Path.GetExtension(path), extension, StringComparison.OrdinalIgnoreCase))
-                .ToArray();
-        }
-
-        var searchDirectoryPattern = Path.GetDirectoryName(normalizedPattern);
-        var searchDirectory = string.IsNullOrWhiteSpace(searchDirectoryPattern)
-            ? projectDirectory
-            : Path.GetFullPath(Path.Combine(projectDirectory, searchDirectoryPattern));
-        var filePatternInDirectory = Path.GetFileName(normalizedPattern);
-
-        if (string.IsNullOrWhiteSpace(filePatternInDirectory) || !Directory.Exists(searchDirectory))
+        var wildcardIndex = normalizedPattern.IndexOfAny(['*', '?']);
+        if (wildcardIndex < 0)
         {
             return Array.Empty<string>();
         }
 
+        var separatorBeforeWildcard = normalizedPattern.LastIndexOfAny([Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar], wildcardIndex);
+        var searchDirectoryPattern = separatorBeforeWildcard < 0
+            ? string.Empty
+            : normalizedPattern[..separatorBeforeWildcard];
+        var searchDirectory = string.IsNullOrWhiteSpace(searchDirectoryPattern)
+            ? projectDirectory
+            : Path.GetFullPath(Path.Combine(projectDirectory, searchDirectoryPattern));
+
+        if (!Directory.Exists(searchDirectory))
+        {
+            return Array.Empty<string>();
+        }
+
+        var regex = BuildGlobRegex(normalizedPattern);
+
         return Directory
-            .EnumerateFiles(searchDirectory, filePatternInDirectory, SearchOption.TopDirectoryOnly)
+            .EnumerateFiles(searchDirectory, "*", SearchOption.AllDirectories)
             .Select(Path.GetFullPath)
             .Where(path => string.Equals(Path.GetExtension(path), extension, StringComparison.OrdinalIgnoreCase))
+            .Where(path =>
+            {
+                var relativePath = NormalizeGlobPath(Path.GetRelativePath(projectDirectory, path));
+                return regex.IsMatch(relativePath);
+            })
             .ToArray();
+    }
+
+    private static Regex BuildGlobRegex(string pattern)
+    {
+        var normalizedPattern = NormalizeGlobPath(pattern);
+        var builder = new System.Text.StringBuilder();
+        builder.Append('^');
+
+        for (var index = 0; index < normalizedPattern.Length; index++)
+        {
+            var current = normalizedPattern[index];
+            if (current == '*')
+            {
+                var isDoubleStar = index + 1 < normalizedPattern.Length && normalizedPattern[index + 1] == '*';
+                if (isDoubleStar)
+                {
+                    var hasTrailingSeparator = index + 2 < normalizedPattern.Length && normalizedPattern[index + 2] == '/';
+                    if (hasTrailingSeparator)
+                    {
+                        builder.Append("(?:.*/)?");
+                        index += 2;
+                    }
+                    else
+                    {
+                        builder.Append(".*");
+                        index++;
+                    }
+
+                    continue;
+                }
+
+                builder.Append("[^/]*");
+                continue;
+            }
+
+            if (current == '?')
+            {
+                builder.Append("[^/]");
+                continue;
+            }
+
+            if (current == '/')
+            {
+                builder.Append('/');
+                continue;
+            }
+
+            builder.Append(Regex.Escape(current.ToString()));
+        }
+
+        builder.Append('$');
+        return new Regex(builder.ToString(), RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+    }
+
+    private static string NormalizeGlobPath(string path)
+    {
+        return path.Replace('\\', '/');
     }
 
     private static void AddProjectReferenceFromAttribute(

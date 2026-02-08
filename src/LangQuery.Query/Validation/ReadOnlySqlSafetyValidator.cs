@@ -51,6 +51,8 @@ public sealed class ReadOnlySqlSafetyValidator : ISqlSafetyValidator
         var builder = new StringBuilder(sql.Length);
         var inSingleQuote = false;
         var inDoubleQuote = false;
+        var inBacktickQuote = false;
+        var inBracketIdentifier = false;
         var inLineComment = false;
         var inBlockComment = false;
 
@@ -90,7 +92,7 @@ public sealed class ReadOnlySqlSafetyValidator : ISqlSafetyValidator
                 continue;
             }
 
-            if (!inSingleQuote && !inDoubleQuote)
+            if (!inSingleQuote && !inDoubleQuote && !inBacktickQuote && !inBracketIdentifier)
             {
                 if (c == '-' && next == '-')
                 {
@@ -109,7 +111,7 @@ public sealed class ReadOnlySqlSafetyValidator : ISqlSafetyValidator
                 }
             }
 
-            if (!inDoubleQuote && c == '\'')
+            if (!inDoubleQuote && !inBacktickQuote && !inBracketIdentifier && c == '\'')
             {
                 if (inSingleQuote && next == '\'')
                 {
@@ -123,14 +125,52 @@ public sealed class ReadOnlySqlSafetyValidator : ISqlSafetyValidator
                 continue;
             }
 
-            if (!inSingleQuote && c == '"')
+            if (!inSingleQuote && !inBacktickQuote && !inBracketIdentifier && c == '"')
             {
                 inDoubleQuote = !inDoubleQuote;
                 builder.Append(' ');
                 continue;
             }
 
-            builder.Append(inSingleQuote || inDoubleQuote ? ' ' : c);
+            if (!inSingleQuote && !inDoubleQuote && !inBracketIdentifier && c == '`')
+            {
+                if (inBacktickQuote && next == '`')
+                {
+                    builder.Append("  ");
+                    i++;
+                    continue;
+                }
+
+                inBacktickQuote = !inBacktickQuote;
+                builder.Append(' ');
+                continue;
+            }
+
+            if (!inSingleQuote && !inDoubleQuote && !inBacktickQuote)
+            {
+                if (!inBracketIdentifier && c == '[')
+                {
+                    inBracketIdentifier = true;
+                    builder.Append(' ');
+                    continue;
+                }
+
+                if (inBracketIdentifier && c == ']')
+                {
+                    if (next == ']')
+                    {
+                        builder.Append("  ");
+                        i++;
+                        continue;
+                    }
+
+                    inBracketIdentifier = false;
+                    builder.Append(' ');
+                    continue;
+                }
+            }
+
+            builder.Append(inSingleQuote || inDoubleQuote || inBacktickQuote || inBracketIdentifier ? ' ' : c);
         }
 
         return builder.ToString();

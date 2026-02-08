@@ -6,6 +6,8 @@ public interface IStorageEngine
 {
     Task InitializeAsync(string databasePath, CancellationToken cancellationToken);
 
+    Task InitializeReadOnlyAsync(string databasePath, CancellationToken cancellationToken);
+
     Task<IReadOnlyDictionary<string, string>> GetIndexedFileHashesAsync(string databasePath, CancellationToken cancellationToken);
 
     Task PersistFactsAsync(

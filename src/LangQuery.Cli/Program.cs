@@ -234,17 +234,44 @@ static async Task<int> HandleSimpleSchemaAsync(ParsedArgs parsed, LangQueryServi
 
 static async Task<int> HandleExportJsonAsync(ParsedArgs parsed, LangQueryService service)
 {
-    if (!TryResolveSolution(parsed, "exportjson", out var solution))
+    ResolvedSolution? solution = null;
+    var hasExplicitSolution = parsed.Options.TryGetValue("solution", out var solutionValue) && !string.IsNullOrWhiteSpace(solutionValue);
+
+    string databasePath;
+    if (TryGetDatabasePath(parsed, solution: null, out var explicitDatabasePath))
     {
-        return 1;
+        databasePath = explicitDatabasePath;
+        var databaseExists = File.Exists(Path.GetFullPath(databasePath));
+        var requiresRebuild = hasExplicitSolution || !databaseExists;
+
+        if (requiresRebuild)
+        {
+            if (!TryResolveSolution(parsed, "exportjson", out var resolvedSolution))
+            {
+                return 1;
+            }
+
+            solution = resolvedSolution;
+        }
+    }
+    else
+    {
+        if (!TryResolveSolution(parsed, "exportjson", out var resolvedSolution))
+        {
+            return 1;
+        }
+
+        solution = resolvedSolution;
+        if (!TryGetDatabasePath(parsed, solution, out databasePath))
+        {
+            return 1;
+        }
     }
 
-    if (!TryGetDatabasePath(parsed, solution, out var databasePath))
+    if (solution is not null)
     {
-        return 1;
+        await service.ScanAsync(new ScanOptions(solution.FilePath, databasePath, ChangedOnly: false), CancellationToken.None).ConfigureAwait(false);
     }
-
-    await service.ScanAsync(new ScanOptions(solution.FilePath, databasePath, ChangedOnly: false), CancellationToken.None).ConfigureAwait(false);
 
     var exportPath = ResolveExportJsonPath(parsed, databasePath);
     var fullExportPath = Path.GetFullPath(exportPath);
@@ -1222,17 +1249,19 @@ static ParsedArgs ParseOptions(string command, string[] args, int startIndex)
             return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Unexpected token '{token}'. Options must use '--name value' format.");
         }
 
-        var name = token[2..].Trim();
-        if (name.Length == 0)
+        var rawName = token[2..].Trim();
+        if (rawName.Length == 0)
         {
             return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: "Option name cannot be empty.");
         }
+
+        var name = rawName.ToLowerInvariant();
 
         if (commandSpec.FlagOptions.Contains(name))
         {
             if (i + 1 < args.Length && !args[i + 1].StartsWith("--", StringComparison.Ordinal))
             {
-                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{name}' does not accept a value.");
+                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{rawName}' does not accept a value.");
             }
 
             flags.Add(name);
@@ -1243,7 +1272,7 @@ static ParsedArgs ParseOptions(string command, string[] args, int startIndex)
         {
             if (i + 1 >= args.Length || args[i + 1].StartsWith("--", StringComparison.Ordinal))
             {
-                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{name}' requires a value.");
+                return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: $"Option '--{rawName}' requires a value.");
             }
 
             options[name] = args[i + 1];
@@ -1256,7 +1285,7 @@ static ParsedArgs ParseOptions(string command, string[] args, int startIndex)
             options,
             flags,
             Pretty: flags.Contains("pretty"),
-            Error: $"Unknown option '--{name}' for command '{command}'.");
+            Error: $"Unknown option '--{rawName}' for command '{command}'.");
     }
 
     return new ParsedArgs(command, options, flags, Pretty: flags.Contains("pretty"), Error: null);

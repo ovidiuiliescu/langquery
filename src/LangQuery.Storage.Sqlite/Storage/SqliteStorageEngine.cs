@@ -10,6 +10,8 @@ namespace LangQuery.Storage.Sqlite.Storage;
 public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : IStorageEngine
 {
     private const int CurrentSchemaVersion = 5;
+    private const int BusyTimeoutMs = 250;
+    private const int MaxBusyRetries = 3;
     private const string OwnershipCapabilityKey = "owner";
     private const string OwnershipCapabilityValue = "langquery";
 
@@ -18,47 +20,75 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
         EnsureParentDirectory(databasePath);
 
-        await using var connection = CreateConnection(databasePath, readOnly: false);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await EnableForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
-        await EnsureDatabaseOwnershipAsync(connection, databasePath, cancellationToken).ConfigureAwait(false);
-
-        var version = await GetSchemaVersionInternalAsync(connection, cancellationToken).ConfigureAwait(false);
-        if (version < CurrentSchemaVersion)
+        await ExecuteWithLockRetryAsync(async token =>
         {
-            await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-            try
+            await using var connection = CreateConnection(databasePath, readOnly: false);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: false, token).ConfigureAwait(false);
+            await EnsureDatabaseOwnershipAsync(connection, databasePath, token).ConfigureAwait(false);
+
+            var version = await GetSchemaVersionInternalAsync(connection, token).ConfigureAwait(false);
+            EnsureSchemaVersionIsSupported(version, databasePath);
+            if (version < CurrentSchemaVersion)
             {
-                await ApplyMigrationsAsync(connection, tx, cancellationToken).ConfigureAwait(false);
-                await SetSchemaVersionAsync(connection, tx, CurrentSchemaVersion, cancellationToken).ConfigureAwait(false);
-                await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+                await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(token).ConfigureAwait(false);
+                try
+                {
+                    await ApplyMigrationsAsync(connection, tx, token).ConfigureAwait(false);
+                    await SetSchemaVersionAsync(connection, tx, CurrentSchemaVersion, token).ConfigureAwait(false);
+                    await tx.CommitAsync(token).ConfigureAwait(false);
+                }
+                catch
+                {
+                    await tx.RollbackAsync(token).ConfigureAwait(false);
+                    throw;
+                }
             }
-            catch
-            {
-                await tx.RollbackAsync(cancellationToken).ConfigureAwait(false);
-                throw;
-            }
+
+            await SeedCapabilitiesAsync(connection, token).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
+    }
+
+    public async Task InitializeReadOnlyAsync(string databasePath, CancellationToken cancellationToken)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(databasePath);
+        var fullPath = Path.GetFullPath(databasePath);
+        if (!File.Exists(fullPath))
+        {
+            throw new FileNotFoundException($"Database '{fullPath}' does not exist.", fullPath);
         }
 
-        await SeedCapabilitiesAsync(connection, cancellationToken).ConfigureAwait(false);
+        await ExecuteWithLockRetryAsync(async token =>
+        {
+            await using var connection = CreateConnection(databasePath, readOnly: true);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: true, token).ConfigureAwait(false);
+
+            var version = await GetSchemaVersionInternalAsync(connection, token).ConfigureAwait(false);
+            EnsureSchemaVersionIsSupported(version, databasePath);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<IReadOnlyDictionary<string, string>> GetIndexedFileHashesAsync(string databasePath, CancellationToken cancellationToken)
     {
-        await using var connection = CreateConnection(databasePath, readOnly: true);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-        var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT path, hash FROM files;";
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        return await ExecuteWithLockRetryAsync(async token =>
         {
-            result[reader.GetString(0)] = reader.GetString(1);
-        }
+            await using var connection = CreateConnection(databasePath, readOnly: true);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: true, token).ConfigureAwait(false);
 
-        return result;
+            var result = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT path, hash FROM files;";
+
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            {
+                result[reader.GetString(0)] = reader.GetString(1);
+            }
+
+            return (IReadOnlyDictionary<string, string>)result;
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task PersistFactsAsync(
@@ -68,46 +98,49 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
         bool fullRebuild,
         CancellationToken cancellationToken)
     {
-        await using var connection = CreateConnection(databasePath, readOnly: false);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        await EnableForeignKeysAsync(connection, cancellationToken).ConfigureAwait(false);
-
-        await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(cancellationToken).ConfigureAwait(false);
-
-        if (fullRebuild)
+        await ExecuteWithLockRetryAsync(async token =>
         {
-            await ExecuteAsync(connection, tx, "DELETE FROM files;", cancellationToken).ConfigureAwait(false);
-        }
-        else
-        {
-            foreach (var removedPath in removedPaths)
+            await using var connection = CreateConnection(databasePath, readOnly: false);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: false, token).ConfigureAwait(false);
+
+            await using var tx = (SqliteTransaction)await connection.BeginTransactionAsync(token).ConfigureAwait(false);
+
+            if (fullRebuild)
             {
-                await ExecuteAsync(connection, tx, "DELETE FROM files WHERE path = $path;", cancellationToken, ("$path", removedPath)).ConfigureAwait(false);
+                await ExecuteAsync(connection, tx, "DELETE FROM files;", token).ConfigureAwait(false);
             }
-        }
+            else
+            {
+                foreach (var removedPath in removedPaths)
+                {
+                    await ExecuteAsync(connection, tx, "DELETE FROM files WHERE path = $path;", token, ("$path", removedPath)).ConfigureAwait(false);
+                }
+            }
 
-        foreach (var fileFacts in facts)
-        {
-            cancellationToken.ThrowIfCancellationRequested();
-            var fileId = await UpsertFileAsync(connection, tx, fileFacts, cancellationToken).ConfigureAwait(false);
-            await DeleteFactsForFileAsync(connection, tx, fileId, cancellationToken).ConfigureAwait(false);
+            foreach (var fileFacts in facts)
+            {
+                token.ThrowIfCancellationRequested();
+                var fileId = await UpsertFileAsync(connection, tx, fileFacts, token).ConfigureAwait(false);
+                await DeleteFactsForFileAsync(connection, tx, fileId, token).ConfigureAwait(false);
 
-            var typeIds = await InsertTypesAsync(connection, tx, fileId, fileFacts.Types, cancellationToken).ConfigureAwait(false);
-            await InsertTypeInheritancesAsync(connection, tx, fileFacts.TypeInheritances, typeIds, cancellationToken).ConfigureAwait(false);
-            var methodIds = await InsertMethodsAsync(connection, tx, fileId, fileFacts.Methods, typeIds, cancellationToken).ConfigureAwait(false);
-            var lineIds = await InsertLinesAsync(connection, tx, fileId, fileFacts.Lines, methodIds, cancellationToken).ConfigureAwait(false);
-            var variableIds = await InsertVariablesAsync(connection, tx, fileFacts.Variables, methodIds, cancellationToken).ConfigureAwait(false);
+                var typeIds = await InsertTypesAsync(connection, tx, fileId, fileFacts.Types, token).ConfigureAwait(false);
+                await InsertTypeInheritancesAsync(connection, tx, fileFacts.TypeInheritances, typeIds, token).ConfigureAwait(false);
+                var methodIds = await InsertMethodsAsync(connection, tx, fileId, fileFacts.Methods, typeIds, token).ConfigureAwait(false);
+                var lineIds = await InsertLinesAsync(connection, tx, fileId, fileFacts.Lines, methodIds, token).ConfigureAwait(false);
+                var variableIds = await InsertVariablesAsync(connection, tx, fileFacts.Variables, methodIds, token).ConfigureAwait(false);
 
-            await InsertLineVariablesAsync(connection, tx, fileFacts.LineVariables, lineIds, variableIds, cancellationToken).ConfigureAwait(false);
-            await InsertInvocationsAsync(connection, tx, fileFacts.Invocations, methodIds, cancellationToken).ConfigureAwait(false);
-            await InsertSymbolRefsAsync(connection, tx, fileId, fileFacts.SymbolReferences, methodIds, cancellationToken).ConfigureAwait(false);
-        }
+                await InsertLineVariablesAsync(connection, tx, fileFacts.LineVariables, lineIds, variableIds, token).ConfigureAwait(false);
+                await InsertInvocationsAsync(connection, tx, fileFacts.Invocations, methodIds, token).ConfigureAwait(false);
+                await InsertSymbolRefsAsync(connection, tx, fileId, fileFacts.SymbolReferences, methodIds, token).ConfigureAwait(false);
+            }
 
-        await UpsertScanStateAsync(connection, tx, "last_scan_utc", DateTimeOffset.UtcNow.ToString("O"), cancellationToken).ConfigureAwait(false);
-        await UpsertScanStateAsync(connection, tx, "scanned_files", facts.Count.ToString(CultureInfo.InvariantCulture), cancellationToken).ConfigureAwait(false);
-        await UpsertScanStateAsync(connection, tx, "removed_files", removedPaths.Count.ToString(CultureInfo.InvariantCulture), cancellationToken).ConfigureAwait(false);
+            await UpsertScanStateAsync(connection, tx, "last_scan_utc", DateTimeOffset.UtcNow.ToString("O"), token).ConfigureAwait(false);
+            await UpsertScanStateAsync(connection, tx, "scanned_files", facts.Count.ToString(CultureInfo.InvariantCulture), token).ConfigureAwait(false);
+            await UpsertScanStateAsync(connection, tx, "removed_files", removedPaths.Count.ToString(CultureInfo.InvariantCulture), token).ConfigureAwait(false);
 
-        await tx.CommitAsync(cancellationToken).ConfigureAwait(false);
+            await tx.CommitAsync(token).ConfigureAwait(false);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<QueryResult> ExecuteReadOnlyQueryAsync(QueryOptions options, CancellationToken cancellationToken)
@@ -118,87 +151,102 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
             throw new InvalidOperationException(validation.ErrorMessage ?? "Invalid SQL.");
         }
 
-        var stopwatch = Stopwatch.StartNew();
-        await using var connection = CreateConnection(options.DatabasePath, readOnly: true);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-        await using var command = connection.CreateCommand();
-        command.CommandText = options.Sql;
-        command.CommandTimeout = 0;
-
-        var columns = new List<string>();
-        var rowColumnNames = new List<string>();
-        var rows = new List<IReadOnlyDictionary<string, object?>>();
-        var truncated = false;
-        var maxRows = Math.Max(1, options.MaxRows);
-
-        using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(1, options.TimeoutMs)));
-        using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken, timeoutCts.Token);
-        var executionToken = linkedCts.Token;
-
-        try
+        return await ExecuteWithLockRetryAsync(async token =>
         {
-            await using var reader = await command.ExecuteReaderAsync(executionToken).ConfigureAwait(false);
-            for (var i = 0; i < reader.FieldCount; i++)
+            var stopwatch = Stopwatch.StartNew();
+            await using var connection = CreateConnection(options.DatabasePath, readOnly: true);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: true, token).ConfigureAwait(false);
+
+            await using var command = connection.CreateCommand();
+            command.CommandText = options.Sql;
+            command.CommandTimeout = 0;
+
+            var columns = new List<string>();
+            var normalizedColumns = new List<string>();
+            var rows = new List<IReadOnlyDictionary<string, object?>>();
+            var truncated = false;
+            var maxRows = Math.Max(1, options.MaxRows);
+
+            using var timeoutCts = new CancellationTokenSource(TimeSpan.FromMilliseconds(Math.Max(1, options.TimeoutMs)));
+            using var linkedCts = CancellationTokenSource.CreateLinkedTokenSource(token, timeoutCts.Token);
+            var executionToken = linkedCts.Token;
+
+            try
             {
-                columns.Add(reader.GetName(i));
-            }
-
-            rowColumnNames.AddRange(BuildUniqueColumnNames(columns));
-
-            while (await reader.ReadAsync(executionToken).ConfigureAwait(false))
-            {
-                if (rows.Count >= maxRows)
-                {
-                    truncated = true;
-                    break;
-                }
-
-                var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                await using var reader = await command.ExecuteReaderAsync(executionToken).ConfigureAwait(false);
                 for (var i = 0; i < reader.FieldCount; i++)
                 {
-                    row[rowColumnNames[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    columns.Add(reader.GetName(i));
                 }
 
-                rows.Add(row);
-            }
-        }
-        catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested && !cancellationToken.IsCancellationRequested)
-        {
-            throw new TimeoutException($"SQL query timed out after {Math.Max(1, options.TimeoutMs)} ms.", ex);
-        }
+                normalizedColumns.AddRange(BuildUniqueColumnNames(columns));
 
-        stopwatch.Stop();
-        return new QueryResult(columns, rows, truncated, stopwatch.Elapsed);
+                while (await reader.ReadAsync(executionToken).ConfigureAwait(false))
+                {
+                    if (rows.Count >= maxRows)
+                    {
+                        truncated = true;
+                        break;
+                    }
+
+                    var row = new Dictionary<string, object?>(StringComparer.OrdinalIgnoreCase);
+                    for (var i = 0; i < reader.FieldCount; i++)
+                    {
+                        row[normalizedColumns[i]] = reader.IsDBNull(i) ? null : reader.GetValue(i);
+                    }
+
+                    rows.Add(row);
+                }
+            }
+            catch (OperationCanceledException ex) when (timeoutCts.IsCancellationRequested && !token.IsCancellationRequested)
+            {
+                throw new TimeoutException($"SQL query timed out after {Math.Max(1, options.TimeoutMs)} ms.", ex);
+            }
+
+            stopwatch.Stop();
+            return new QueryResult(normalizedColumns, rows, truncated, stopwatch.Elapsed);
+        }, cancellationToken).ConfigureAwait(false);
     }
     public async Task<SchemaDescription> DescribeSchemaAsync(string databasePath, CancellationToken cancellationToken)
     {
-        await using var connection = CreateConnection(databasePath, readOnly: true);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-
-        var version = await GetSchemaVersionInternalAsync(connection, cancellationToken).ConfigureAwait(false);
-        var entities = new List<SchemaEntity>();
-        await using var command = connection.CreateCommand();
-        command.CommandText = "SELECT name, type, IFNULL(sql, '') FROM sqlite_master WHERE (name LIKE 'v1_%' OR name LIKE 'meta_%') AND type IN ('table', 'view') ORDER BY type, name;";
-
-        await using var reader = await command.ExecuteReaderAsync(cancellationToken).ConfigureAwait(false);
-        while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
+        return await ExecuteWithLockRetryAsync(async token =>
         {
-            var name = reader.GetString(0);
-            var kind = reader.GetString(1);
-            var sql = reader.GetString(2);
-            var columns = await DescribeColumnsAsync(connection, name, cancellationToken).ConfigureAwait(false);
-            entities.Add(new SchemaEntity(name, kind, sql, columns));
-        }
+            await using var connection = CreateConnection(databasePath, readOnly: true);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: true, token).ConfigureAwait(false);
 
-        return new SchemaDescription(version, entities);
+            var version = await GetSchemaVersionInternalAsync(connection, token).ConfigureAwait(false);
+            EnsureSchemaVersionIsSupported(version, databasePath);
+            var entities = new List<SchemaEntity>();
+            await using var command = connection.CreateCommand();
+            command.CommandText = "SELECT name, type, IFNULL(sql, '') FROM sqlite_master WHERE (name LIKE 'v1_%' OR name LIKE 'meta_%') AND type IN ('table', 'view') ORDER BY type, name;";
+
+            await using var reader = await command.ExecuteReaderAsync(token).ConfigureAwait(false);
+            while (await reader.ReadAsync(token).ConfigureAwait(false))
+            {
+                var name = reader.GetString(0);
+                var kind = reader.GetString(1);
+                var sql = reader.GetString(2);
+                var columns = await DescribeColumnsAsync(connection, name, token).ConfigureAwait(false);
+                entities.Add(new SchemaEntity(name, kind, sql, columns));
+            }
+
+            return new SchemaDescription(version, entities);
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     public async Task<int> GetSchemaVersionAsync(string databasePath, CancellationToken cancellationToken)
     {
-        await using var connection = CreateConnection(databasePath, readOnly: true);
-        await connection.OpenAsync(cancellationToken).ConfigureAwait(false);
-        return await GetSchemaVersionInternalAsync(connection, cancellationToken).ConfigureAwait(false);
+        return await ExecuteWithLockRetryAsync(async token =>
+        {
+            await using var connection = CreateConnection(databasePath, readOnly: true);
+            await connection.OpenAsync(token).ConfigureAwait(false);
+            await ConfigureConnectionAsync(connection, readOnly: true, token).ConfigureAwait(false);
+            var version = await GetSchemaVersionInternalAsync(connection, token).ConfigureAwait(false);
+            EnsureSchemaVersionIsSupported(version, databasePath);
+            return version;
+        }, cancellationToken).ConfigureAwait(false);
     }
 
     private static async Task UpsertScanStateAsync(SqliteConnection connection, SqliteTransaction tx, string key, string value, CancellationToken cancellationToken)
@@ -691,14 +739,67 @@ public sealed class SqliteStorageEngine(ISqlSafetyValidator safetyValidator) : I
             DataSource = Path.GetFullPath(databasePath),
             Mode = readOnly ? SqliteOpenMode.ReadOnly : SqliteOpenMode.ReadWriteCreate,
             Pooling = true,
+            DefaultTimeout = 1,
             ForeignKeys = !readOnly
         };
         return new SqliteConnection(builder.ConnectionString);
     }
 
-    private static async Task EnableForeignKeysAsync(SqliteConnection connection, CancellationToken cancellationToken)
+    private static async Task ConfigureConnectionAsync(SqliteConnection connection, bool readOnly, CancellationToken cancellationToken)
     {
+        await ExecuteAsync(connection, null, $"PRAGMA busy_timeout = {BusyTimeoutMs};", cancellationToken).ConfigureAwait(false);
+        if (readOnly)
+        {
+            return;
+        }
+
         await ExecuteAsync(connection, null, "PRAGMA foreign_keys = ON;", cancellationToken).ConfigureAwait(false);
+    }
+
+    private static void EnsureSchemaVersionIsSupported(int version, string databasePath)
+    {
+        if (version <= CurrentSchemaVersion)
+        {
+            return;
+        }
+
+        throw new InvalidOperationException($"Database '{Path.GetFullPath(databasePath)}' schema version {version} is newer than the maximum supported version {CurrentSchemaVersion}. Upgrade LangQuery to continue.");
+    }
+
+    private static Task ExecuteWithLockRetryAsync(Func<CancellationToken, Task> operation, CancellationToken cancellationToken)
+    {
+        return ExecuteWithLockRetryAsync(async token =>
+        {
+            await operation(token).ConfigureAwait(false);
+            return true;
+        }, cancellationToken);
+    }
+
+    private static async Task<T> ExecuteWithLockRetryAsync<T>(Func<CancellationToken, Task<T>> operation, CancellationToken cancellationToken)
+    {
+        for (var attempt = 0; ; attempt++)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            try
+            {
+                return await operation(cancellationToken).ConfigureAwait(false);
+            }
+            catch (SqliteException ex) when (IsLockContention(ex) && attempt < MaxBusyRetries)
+            {
+                await Task.Delay(GetRetryDelay(attempt), cancellationToken).ConfigureAwait(false);
+            }
+        }
+    }
+
+    private static bool IsLockContention(SqliteException exception)
+    {
+        return exception.SqliteErrorCode == 5 || exception.SqliteErrorCode == 6;
+    }
+
+    private static TimeSpan GetRetryDelay(int attempt)
+    {
+        var delayMs = (attempt + 1) * 100;
+        return TimeSpan.FromMilliseconds(delayMs);
     }
 
     private static void EnsureParentDirectory(string databasePath)

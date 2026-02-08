@@ -466,13 +466,14 @@ public sealed class SqliteStorageEngineTests
 
             Assert.Equal(3, result.Columns.Count);
             Assert.Equal("duplicate", result.Columns[0]);
-            Assert.Equal("duplicate", result.Columns[1]);
-            Assert.Equal("DUPLICATE", result.Columns[2]);
+            Assert.Equal("duplicate_2", result.Columns[1]);
+            Assert.Equal("DUPLICATE_3", result.Columns[2]);
 
             var row = Assert.Single(result.Rows);
             Assert.Equal(1L, Convert.ToInt64(row["duplicate"], CultureInfo.InvariantCulture));
             Assert.Equal(2L, Convert.ToInt64(row["duplicate_2"], CultureInfo.InvariantCulture));
-            Assert.Equal(3L, Convert.ToInt64(row["duplicate_3"], CultureInfo.InvariantCulture));
+            Assert.Equal(3L, Convert.ToInt64(row[result.Columns[2]], CultureInfo.InvariantCulture));
+            Assert.All(result.Columns, column => Assert.True(row.ContainsKey(column)));
         }
         finally
         {
@@ -546,6 +547,164 @@ public sealed class SqliteStorageEngineTests
             var schema = await storage.DescribeSchemaAsync(databasePath, CancellationToken.None);
 
             Assert.Contains(schema.Entities, entity => entity.Name == "meta_scan_state" && entity.Kind == "table");
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeReadOnlyAsync_AllowsQueryAndSchemaOnReadOnlyDatabaseFile()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            File.SetAttributes(databasePath, File.GetAttributes(databasePath) | FileAttributes.ReadOnly);
+
+            await storage.InitializeReadOnlyAsync(databasePath, CancellationToken.None);
+
+            var query = await storage.ExecuteReadOnlyQueryAsync(
+                new QueryOptions(databasePath, "SELECT key FROM meta_capabilities WHERE key = 'owner'", MaxRows: 10),
+                CancellationToken.None);
+            var schema = await storage.DescribeSchemaAsync(databasePath, CancellationToken.None);
+
+            Assert.Single(query.Rows);
+            Assert.Equal("owner", Convert.ToString(query.Rows[0]["key"], CultureInfo.InvariantCulture));
+            Assert.Equal(5, schema.SchemaVersion);
+        }
+        finally
+        {
+            if (File.Exists(databasePath))
+            {
+                var attributes = File.GetAttributes(databasePath);
+                if ((attributes & FileAttributes.ReadOnly) != 0)
+                {
+                    File.SetAttributes(databasePath, attributes & ~FileAttributes.ReadOnly);
+                }
+            }
+
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeAsync_WhenSchemaVersionIsNewerThanSupported_ThrowsFast()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            await CreateDatabaseWithSchemaVersionAsync(databasePath, 999);
+            var storage = CreateStorage();
+
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => storage.InitializeAsync(databasePath, CancellationToken.None));
+
+            Assert.Contains("schema version", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("999", error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task InitializeReadOnlyAsync_WhenSchemaVersionIsNewerThanSupported_ThrowsFast()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            await CreateDatabaseWithSchemaVersionAsync(databasePath, 999);
+            var storage = CreateStorage();
+
+            var error = await Assert.ThrowsAsync<InvalidOperationException>(() => storage.InitializeReadOnlyAsync(databasePath, CancellationToken.None));
+
+            Assert.Contains("schema version", error.Message, StringComparison.OrdinalIgnoreCase);
+            Assert.Contains("999", error.Message, StringComparison.Ordinal);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_WhenLockIsTransient_RetriesAndSucceeds()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            await using var lockConnection = new SqliteConnection($"Data Source={databasePath}");
+            await lockConnection.OpenAsync(CancellationToken.None);
+            await using var lockCommand = lockConnection.CreateCommand();
+            lockCommand.CommandText = "BEGIN EXCLUSIVE;";
+            await lockCommand.ExecuteNonQueryAsync(CancellationToken.None);
+
+            var releaseTask = Task.Run(async () =>
+            {
+                await Task.Delay(700).ConfigureAwait(false);
+                await using var releaseCommand = lockConnection.CreateCommand();
+                releaseCommand.CommandText = "ROLLBACK;";
+                await releaseCommand.ExecuteNonQueryAsync(CancellationToken.None).ConfigureAwait(false);
+            });
+
+            await storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("Locked.cs", "HASH")],
+                Array.Empty<string>(),
+                fullRebuild: false,
+                CancellationToken.None);
+
+            await releaseTask;
+            var hashes = await storage.GetIndexedFileHashesAsync(databasePath, CancellationToken.None);
+            Assert.Contains(Path.GetFullPath("Locked.cs"), hashes.Keys, StringComparer.OrdinalIgnoreCase);
+        }
+        finally
+        {
+            DeleteTempDatabase(databasePath);
+        }
+    }
+
+    [Fact]
+    public async Task PersistFactsAsync_WhenLockPersists_FailsAfterBoundedRetries()
+    {
+        var databasePath = CreateTempDatabasePath();
+
+        try
+        {
+            var storage = CreateStorage();
+            await storage.InitializeAsync(databasePath, CancellationToken.None);
+
+            await using var lockConnection = new SqliteConnection($"Data Source={databasePath}");
+            await lockConnection.OpenAsync(CancellationToken.None);
+            await using var lockCommand = lockConnection.CreateCommand();
+            lockCommand.CommandText = "BEGIN EXCLUSIVE;";
+            await lockCommand.ExecuteNonQueryAsync(CancellationToken.None);
+
+            var stopwatch = Stopwatch.StartNew();
+            await Assert.ThrowsAsync<SqliteException>(() => storage.PersistFactsAsync(
+                databasePath,
+                [CreateSimpleFacts("LockedForever.cs", "HASH")],
+                Array.Empty<string>(),
+                fullRebuild: false,
+                CancellationToken.None));
+            stopwatch.Stop();
+
+            Assert.True(stopwatch.Elapsed < TimeSpan.FromSeconds(12), $"Expected bounded retries, elapsed {stopwatch.Elapsed.TotalMilliseconds:F0} ms.");
+
+            await using var releaseCommand = lockConnection.CreateCommand();
+            releaseCommand.CommandText = "ROLLBACK;";
+            await releaseCommand.ExecuteNonQueryAsync(CancellationToken.None);
         }
         finally
         {
@@ -737,6 +896,25 @@ public sealed class SqliteStorageEngineTests
     {
         var directory = Path.Combine(Path.GetTempPath(), "langquery-tests", Guid.NewGuid().ToString("N"));
         return Path.Combine(directory, "facts.db");
+    }
+
+    private static async Task CreateDatabaseWithSchemaVersionAsync(string databasePath, int version)
+    {
+        var parentDirectory = Path.GetDirectoryName(databasePath)
+                              ?? throw new DirectoryNotFoundException($"Could not derive parent directory from '{databasePath}'.");
+        Directory.CreateDirectory(parentDirectory);
+
+        await using var connection = new SqliteConnection($"Data Source={databasePath}");
+        await connection.OpenAsync(CancellationToken.None);
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "CREATE TABLE meta_schema_version(version INTEGER NOT NULL, applied_utc TEXT NOT NULL);"
+            + "INSERT INTO meta_schema_version(version, applied_utc) VALUES ($version, '1970-01-01T00:00:00.0000000+00:00');"
+            + "CREATE TABLE meta_capabilities(key TEXT PRIMARY KEY, value TEXT NOT NULL);"
+            + "INSERT INTO meta_capabilities(key, value) VALUES ('owner', 'langquery');";
+        command.Parameters.AddWithValue("$version", version);
+        await command.ExecuteNonQueryAsync(CancellationToken.None);
     }
 
     private static void DeleteTempDatabase(string databasePath)
