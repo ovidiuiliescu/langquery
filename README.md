@@ -54,7 +54,7 @@ Sample screenshots:
 
 ### Recommended agent workflow
 
-1. After any add/edit/delete/rename, run `langquery scan --changed-only` or `langquery scan` for a complete re-scan.
+1. After any add/edit/delete/rename, prefer a full `langquery scan` (safer and preferred). Use `langquery scan --changed-only` only as an experimental faster path.
 2. `langquery installskill <target>` to refresh the skill after an upgrade.
 3. Ask the agent to answer with SQL evidence and returned rows.
 
@@ -227,6 +227,8 @@ dotnet run --project src/LangQuery.Cli -- <command>
 - `langquery exportjson [file-name] [--solution <folder-or-.sln>] [--db <path>] [--pretty]`
 - `langquery installskill <claude|codex|opencode|all> [--pretty]`
 
+`--changed-only` is experimental; a full `langquery scan` is safer and preferred.
+
 ## Arguments and flags reference (each one explained)
 
 ### `<sql>` (short query positional argument)
@@ -394,11 +396,12 @@ Small sample output:
 
 What it is:
 
-- Incremental scan flag for `scan`.
+- Experimental incremental scan flag for `scan`.
 
 What it does:
 
 - Re-indexes only changed files (and tracks unchanged/removed counts).
+- Can leave stale metadata in unchanged dependents; run a full `langquery scan` when you need maximum correctness.
 
 How it looks:
 

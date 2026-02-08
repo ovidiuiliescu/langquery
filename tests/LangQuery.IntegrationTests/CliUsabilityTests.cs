@@ -72,12 +72,34 @@ public sealed class CliUsabilityTests
             Assert.Contains("\"command\": \"simpleschema\"", skillContent, StringComparison.Ordinal);
             Assert.Contains("Re-scan after every code change", skillContent, StringComparison.Ordinal);
             Assert.Contains("--changed-only", skillContent, StringComparison.Ordinal);
+            Assert.Contains("experimental", skillContent, StringComparison.OrdinalIgnoreCase);
             Assert.DoesNotContain("outdated-skill-content", skillContent, StringComparison.Ordinal);
         }
         finally
         {
             Directory.Delete(sampleRoot, recursive: true);
         }
+    }
+
+    [Fact]
+    public async Task HelpCommand_MarksChangedOnlyAsExperimental()
+    {
+        var result = await RunCliAsync(GetRepositoryRoot(), "help");
+        var payload = ParseJson(result.StdOut);
+
+        Assert.Equal(0, result.ExitCode);
+        Assert.True(payload.GetProperty("success").GetBoolean());
+        Assert.Equal("help", payload.GetProperty("command").GetString());
+
+        var notes = GetPropertyIgnoreCase(GetPropertyIgnoreCase(payload, "data"), "notes")
+            .EnumerateArray()
+            .Select(note => note.GetString())
+            .Where(note => !string.IsNullOrWhiteSpace(note))
+            .ToArray();
+
+        Assert.Contains(notes, note => note!.Contains("--changed-only", StringComparison.Ordinal));
+        Assert.Contains(notes, note => note!.Contains("experimental", StringComparison.OrdinalIgnoreCase));
+        Assert.Contains(notes, note => note!.Contains("full 'scan'", StringComparison.OrdinalIgnoreCase));
     }
 
     [Fact]

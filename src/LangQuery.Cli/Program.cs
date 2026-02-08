@@ -511,7 +511,7 @@ LangQuery indexes a C# solution into a local SQLite database and exposes stable 
 ```
 
 ## Best practices
-- Re-scan after every code change (add/edit/delete/rename): run `langquery scan --solution <folder-or-.sln> --db <path> --changed-only` before SQL prompts.
+- Re-scan after every code change (add/edit/delete/rename): prefer a full `langquery scan` (safer and preferred). Use `langquery scan --solution <folder-or-.sln> --db <path> --changed-only` only as an experimental faster path.
 - Prefer querying `v1_*` views and `meta_*` entities from the public contract instead of private/internal SQLite tables.
 - Keep SQL read-only (`SELECT`, `WITH`, `EXPLAIN`) and set `--max-rows`/`--timeout-ms` for predictable results.
 - Start with broad discovery queries (`COUNT`, grouped summaries, `LIMIT`) before deep joins.
@@ -909,6 +909,7 @@ static object BuildHelpPayload()
         {
             "If '--db' is omitted, the CLI uses '<solution-folder>/.langquery.<solution-name>.db.sqlite'.",
             "If '--solution' is omitted, the current folder is used and exactly one .sln file must be present.",
+            "'--changed-only' is experimental for partial/incremental updates; a full 'scan' is safer and preferred.",
             "For SQL queries, if the DB file does not exist, the CLI runs a scan first and then executes the query.",
             "Use 'examples' to print sample SQL queries from simple to advanced scenarios.",
             "Use 'exportjson [file-name]' to rebuild and export the full SQLite database as one JSON file.",
@@ -930,7 +931,7 @@ static object BuildHelpPayload()
             {
                 name = "scan",
                 usage = "langquery scan [--solution <folder-or-.sln>] [--db <path>] [--changed-only] [--pretty]",
-                description = "Scan C# files and persist extracted facts into SQLite"
+                description = "Scan C# files and persist extracted facts into SQLite ('--changed-only' is experimental)"
             },
             new
             {
